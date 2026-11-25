@@ -1,0 +1,59 @@
+{
+  "name": "novel-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "本地优先的极简小说写作客户端",
+  "author": "",
+  "type": "module",
+  "main": "dist/main.cjs",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:e2e": "npm run build && playwright test",
+    "build": "node scripts/build.mjs",
+    "dist:win": "npm run build && node scripts/package.mjs"
+  },
+  "build": {
+    "appId": "local.novel.desktop",
+    "productName": "Sirona",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json",
+      "THIRD_PARTY_NOTICES.md",
+      "!node_modules/**/*"
+    ],
+    "asar": true,
+    "win": {
+      "target": "portable",
+      "signAndEditExecutable": false
+    },
+    "portable": {
+      "artifactName": "Sirona-${version}-win-x64.exe"
+    }
+  },
+  "dependencies": {
+    "@codemirror/commands": "6.11.1",
+    "@codemirror/search": "6.7.2",
+    "@codemirror/state": "6.7.6",
+    "@codemirror/view": "6.43.15",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.0",
+    "@types/node": "26.6.6",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "electron": "45.3.1",
+    "electron-builder": "26.18.0",
+    "esbuild": "0.28.2",
+    "typescript": "7.0.2",
+    "vite": "8.3.8",
+    "vitest": "5.1.0"
+  }
+}

@@ -1,0 +1,6330 @@
+/**
+ * 小说工坊 · client half
+ *
+ * 形态：
+ * - 侧栏入口：sidebar.footer.action → 开/关工作台
+ * - 全屏工作区：shell.overlay → 一页式界面（左侧导航 + 右侧内容）
+ *
+ * 与旧版的区别：不再「弹窗套弹窗」。所有功能挂在左导航的五个页面里，
+ * 页面之间不复用弹层，操作路径从「点开→再点→再点」压到「点一次」。
+ */
+window.__ModuleLoader__.load({
+  id: 'dsh-novel-workbench',
+  factory: (require) => {
+    var module = { exports: {} }
+    var exports = module.exports
+    Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
+
+    const React = require('react')
+    const { useState, useEffect, useCallback, useRef, useMemo } = React
+
+    const NS = 'dsh-novel-workbench'
+    /**
+     * 桌面版页面是 file://，location.origin 会变成字符串 "null"，
+     * 相对路径会被当成文件路径。与宿主自带客户端插件同一套兜底。
+     */
+    const HOST_BASE = (() => {
+      const loc = globalThis.location
+      return loc !== undefined && loc !== null && typeof loc.origin === 'string' && loc.origin !== 'null' ? loc.origin : 'http://dsh.internal'
+    })()
+    const API = new URL('/novel-studio/api/', HOST_BASE).toString()
+
+    /**
+     * 界面显示的版本号。
+     *
+     * 只在这里写一次：左下角和设置页都用它。
+     * `version.ps1` 就是替换这个字面量，别在别处再写死版本号。
+     */
+    const VERSION_TEXT = 'v3.4.2'
+
+    // ── 开合状态（两个插槽共享） ──────────────────────────────
+    const openStore = { open: false, listeners: new Set() }
+    const setOpen = (v) => {
+      openStore.open = v
+      for (const fn of openStore.listeners) fn(v)
+    }
+    const useOpen = () => {
+      const [v, setV] = useState(openStore.open)
+      useEffect(() => {
+        const fn = (next) => setV(next)
+        openStore.listeners.add(fn)
+        return () => openStore.listeners.delete(fn)
+      }, [])
+      return v
+    }
+
+    /**
+     * 离开守卫：切页面、返回列表、收起工作台之前都要先问一句。
+     * 各页面把自己「有没有未保存的改动 / 怎么保存」注册进来，
+     * 这里统一拦截，避免每个入口各写一遍确认框。
+     */
+    const leaveFlow = {
+      guards: [],
+      pending: null, // { dirty: [{label, save}], after: () => void }
+      listeners: new Set(),
+      /** 注册/注销一个守卫；get 为 null 表示注销 */
+      add(id, get) {
+        this.guards = this.guards.filter((g) => g.id !== id)
+        if (get !== null && get !== undefined) this.guards.push({ id, get })
+      },
+      /** 当前所有未保存的守卫 */
+      dirtyOnes() {
+        const out = []
+        for (const g of this.guards) {
+          let info = null
+          try {
+            info = g.get()
+          } catch {
+            info = null
+          }
+          if (info !== null && info !== undefined && info.dirty === true) out.push({ id: g.id, label: info.label || '内容', save: info.save })
+        }
+        return out
+      },
+      /** 请求离开：没脏就直接走，有脏就挂起等用户选 */
+      request(after) {
+        const dirty = this.dirtyOnes()
+        if (dirty.length === 0) {
+          after()
+          return
+        }
+        this.pending = { dirty, after }
+        this.emit()
+      },
+      /** save=true 保存后离开；false 不保存离开 */
+      resolveSave(save) {
+        const p = this.pending
+        this.pending = null
+        this.emit()
+        if (p === null) return
+        if (save !== true) {
+          p.after()
+          return
+        }
+        Promise.all(p.dirty.map((g) => Promise.resolve().then(() => g.save()))).then(
+          () => p.after(),
+          () => p.after(),
+        )
+      },
+      cancel() {
+        this.pending = null
+        this.emit()
+      },
+      emit() {
+        for (const fn of this.listeners) fn()
+      },
+      subscribe(fn) {
+        this.listeners.add(fn)
+        return () => this.listeners.delete(fn)
+      },
+    }
+
+    // ── 设计系统 ──────────────────────────────────────────────
+    const C = {
+      bg: 'var(--dsh-alias-bg, #f5f5f7)',
+      card: 'var(--dsh-alias-bg-elevated, #ffffff)',
+      text: 'var(--dsh-alias-text, #1c1c1e)',
+      sub: 'var(--dsh-alias-text-secondary, #6b6b70)',
+      border: 'var(--dsh-alias-border, rgba(0,0,0,0.10))',
+      accent: '#0a84ff',
+      ok: '#34c759',
+      warn: '#ff9f0a',
+      danger: '#ff3b30',
+      rail: 'rgba(0,0,0,0.025)',
+    }
+
+    /** 按钮：kind = default | primary | danger | ghost */
+    const btn = (kind) => {
+      const base = {
+        border: '1px solid ' + C.border,
+        background: 'transparent',
+        color: 'inherit',
+        borderRadius: 8,
+        padding: '5px 11px',
+        fontSize: 12.5,
+        cursor: 'pointer',
+        lineHeight: 1.4,
+        whiteSpace: 'nowrap',
+      }
+      if (kind === 'primary') return { ...base, background: C.accent, borderColor: C.accent, color: '#fff', fontWeight: 600 }
+      if (kind === 'danger') return { ...base, color: C.danger, borderColor: C.danger + '55' }
+      if (kind === 'solidDanger') return { ...base, background: C.danger, borderColor: C.danger, color: '#fff', fontWeight: 600 }
+      if (kind === 'ghost') return { ...base, border: '1px solid transparent', color: C.sub }
+      return base
+    }
+
+    const cardStyle = { background: C.card, border: '1px solid ' + C.border, borderRadius: 10 }
+    const inputStyle = {
+      border: '1px solid ' + C.border,
+      borderRadius: 7,
+      padding: '5px 8px',
+      fontSize: 12.5,
+      background: C.card,
+      color: C.text,
+      outline: 'none',
+    }
+    const areaStyle = { ...inputStyle, width: '100%', resize: 'vertical', fontFamily: 'inherit', lineHeight: 1.8 }
+
+    const fmtBytes = (n) => {
+      const v = typeof n === 'number' && n > 0 ? n : 0
+      if (v < 1024) return v + ' B'
+      if (v < 1024 * 1024) return (v / 1024).toFixed(1) + ' KB'
+      return (v / 1024 / 1024).toFixed(1) + ' MB'
+    }
+    const fmtChars = (n) => {
+      const v = Number(n) || 0
+      if (v < 10000) return String(v) + ' 字'
+      return (v / 10000).toFixed(1) + ' 万字'
+    }
+    const fmtTime = (iso) => {
+      if (typeof iso !== 'string' || iso === '') return '—'
+      const d = new Date(iso)
+      if (Number.isNaN(d.getTime())) return iso
+      const p = (n) => String(n).padStart(2, '0')
+      return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes())
+    }
+
+    // ── RPC ──────────────────────────────────────────────────
+    const rpc = async (a, payload) => {
+      // fetch 本身失败时（连接被断、请求体过大被掐），浏览器只会抛一句
+      // 「Failed to fetch」，看不出是插件挂了还是网络断了。这里翻译成能查的话。
+      let r
+      try {
+        r = await fetch(API, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ a, ...(payload === undefined ? {} : payload) }),
+        })
+      } catch (e) {
+        throw new Error(
+          '连不上 dsh 服务（' + String(e && e.message ? e.message : e) + '）。\n' +
+            '常见原因：dsh web 刚重启过（刷新页面即可）、请求体太大被断开（大文件走分片上传）、或插件加载失败。',
+        )
+      }
+      let data = null
+      try {
+        data = await r.json()
+      } catch {
+        data = null
+      }
+      if (data === null) throw new Error('服务没响应（HTTP ' + String(r.status) + '）：重启 dsh web 后再试')
+      if (data.error !== undefined) throw new Error(String(data.error))
+      return data
+    }
+
+    // ── 小组件 ────────────────────────────────────────────────
+    /**
+     * 复制纯文本到剪贴板。
+     * GUI 走 navigator.clipboard（127.0.0.1 算安全上下文）；
+     * 桌面版是 file://，不是安全上下文，退回 textarea + execCommand。
+     */
+    const copyText = async (text) => {
+      const s = String(text === null || text === undefined ? '' : text)
+      if (s === '') throw new Error('没有可复制的内容')
+      const nav = globalThis.navigator
+      if (nav !== undefined && nav !== null && nav.clipboard !== undefined && nav.clipboard !== null) {
+        try {
+          await nav.clipboard.writeText(s)
+          return s.length
+        } catch {
+          // 权限被拒就落到下面的老办法
+        }
+      }
+      const el = globalThis.document.createElement('textarea')
+      el.value = s
+      el.setAttribute('readonly', 'readonly')
+      el.style.position = 'fixed'
+      el.style.top = '-1000px'
+      el.style.opacity = '0'
+      globalThis.document.body.appendChild(el)
+      el.select()
+      let ok = false
+      try {
+        ok = globalThis.document.execCommand('copy')
+      } finally {
+        globalThis.document.body.removeChild(el)
+      }
+      if (ok !== true) throw new Error('浏览器不让复制，手动选中再 Ctrl+C')
+      return s.length
+    }
+
+    /** 在系统文件管理器里定位文件 */
+    const revealPath = async (path) => rpc('path.reveal', { path })
+
+    // ── 小组件 ────────────────────────────────────────────────
+    const Chip = ({ tone, children, title, style }) =>
+      React.createElement(
+        'span',
+        {
+          title,
+          style: {
+            fontSize: 11,
+            padding: '1px 7px',
+            borderRadius: 99,
+            border: '1px solid ' + (tone === undefined ? C.border : tone),
+            color: tone === undefined ? C.sub : tone,
+            whiteSpace: 'nowrap',
+            ...(style === undefined || style === null ? {} : style),
+          },
+        },
+        children,
+      )
+
+    const Empty = ({ children }) =>
+      React.createElement('div', { style: { padding: '40px 20px', textAlign: 'center', color: C.sub, fontSize: 13, lineHeight: 1.9 } }, children)
+
+    // ══════════════════════════════════════════════════════════
+    // 章节页
+    // ══════════════════════════════════════════════════════════
+    function ChapterPage({ state, onRefresh, toast }) {
+      const readFS =
+        state !== null && state.config !== undefined && state.config.readFontSize !== undefined
+          ? Number(state.config.readFontSize)
+          : 12.5
+      const [editing, setEditing] = useState(null) // { chapter, title, text }
+      const [busy, setBusy] = useState(false)
+      const chapters = state === null ? [] : state.chapters || []
+      const groups = (() => {
+        const list = []
+        for (const row of chapters) {
+          const v = row.volume !== undefined && row.volume !== null ? row.volume : { id: 'v0', title: '未分卷' }
+          let g = list.find((x) => x.id === v.id)
+          if (g === undefined) { g = { id: v.id, title: v.title, rows: [] }; list.push(g) }
+          g.rows.push(row)
+        }
+        return list
+      })()
+      const [openVols, setOpenVols] = useState({})
+      const [volDraft, setVolDraft] = useState(null)
+      const [newVol, setNewVol] = useState(null)
+      const [newCh, setNewCh] = useState(null)
+      const editingRef = useRef(null)
+      const saveRef = useRef(null)
+      editingRef.current = editing
+      /** 正文编辑框，用来一键到顶 / 到底 */
+      const bodyRef = useRef(null)
+      const scrollBody = (where) => {
+        const el = bodyRef.current
+        if (el === null || el === undefined) return
+        el.scrollTop = where === 'top' ? 0 : el.scrollHeight
+      }
+      // 剧情总结：哪一章正在生成、批量进度
+      const [sumBusy, setSumBusy] = useState('')
+      const [sumProgress, setSumProgress] = useState(null)
+      // 正在查看的那份总结：{ chapter, text, before, exists, editing }
+      const [sumView, setSumView] = useState(null)
+      // 本地退出确认：有未保存改动时，直接在本组件里问，不依赖外层
+      const [askBack, setAskBack] = useState(false)
+
+      // 有未保存的正文改动时，切页面 / 收起工作台都要先问
+      useEffect(() => {
+        leaveFlow.add('chapter', {
+          get: () => {
+            const cur = editingRef.current
+            if (cur === null) return { dirty: false }
+            return {
+              dirty: cur.text !== cur.before,
+              label: '第' + String(cur.chapter) + '章正文',
+              save: () => (saveRef.current === null ? Promise.resolve() : saveRef.current()),
+            }
+          },
+        })
+        return () => leaveFlow.add('chapter', null)
+      }, [])
+
+      const openChapter = async (chapter) => {
+        setBusy(true)
+        try {
+          const d = await rpc('chapter.get', { chapter })
+          setEditing({ chapter, title: d.title, text: d.text, before: d.text, chars: d.chars, path: d.path })
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const save = async () => {
+        if (editing === null) return
+        setBusy(true)
+        try {
+          const d = await rpc('chapter.save', { chapter: editing.chapter, text: editing.text })
+          toast('已保存（' + String(d.chars) + ' 字），原稿备份在 ' + String(d.backup))
+          setEditing(null)
+          onRefresh()
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      // 守卫要用到最新的 save，但保存函数每次渲染都会重建，所以挂到 ref 上
+      saveRef.current = save
+
+      /** 打开一章的剧情总结来看 */
+      const openSummary = async (row) => {
+        try {
+          const d = await rpc('summary.get', { chapter: row.chapter })
+          setSumView({ chapter: row.chapter, text: d.text, before: d.text, exists: d.exists, editing: false })
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+      /** 手改后保存 */
+      const saveSummary = async () => {
+        if (sumView === null) return
+        try {
+          const d = await rpc('summary.save', { chapter: sumView.chapter, text: sumView.text })
+          toast('第' + String(sumView.chapter) + '章总结已保存（' + String(d.chars) + ' 字）')
+          setSumView({ ...sumView, before: sumView.text, editing: false })
+          onRefresh()
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+      /** 给一章生成剧情总结 */
+      const genSummary = async (row, overwrite) => {
+        setSumBusy(String(row.chapter))
+        try {
+          const d = await rpc('summary.generate', { chapter: row.chapter, overwrite: overwrite === true })
+          toast('第' + String(row.chapter) + '章总结已生成（' + String(d.chars) + ' 字）' + (d.backup ? '，旧总结已备份' : ''))
+          onRefresh()
+        } catch (e) {
+          toast('第' + String(row.chapter) + '章：' + String(e.message || e))
+        } finally {
+          setSumBusy('')
+        }
+      }
+
+      /** 一次补齐所有「有正文没总结」的章 */
+      const fillAllSummaries = async () => {
+        const todo = chapters.filter((c) => c.hasSummary !== true && c.chars > 0)
+        if (todo.length === 0) {
+          toast('所有有正文的章节都有剧情总结了')
+          return
+        }
+        if (!window.confirm('要为 ' + String(todo.length) + ' 章补写剧情总结吗？\n\n会调 ' + String(todo.length) + ' 次模型，逐章生成。')) return
+        for (let i = 0; i < todo.length; i += 1) {
+          const row = todo[i]
+          setSumProgress({ done: i, total: todo.length, current: row.chapter })
+          setSumBusy(String(row.chapter))
+          try {
+            await rpc('summary.generate', { chapter: row.chapter })
+          } catch (e) {
+            toast('第' + String(row.chapter) + '章失败：' + String(e.message || e))
+          }
+        }
+        setSumBusy('')
+        setSumProgress(null)
+        toast('补写完成：' + String(todo.length) + ' 章')
+        onRefresh()
+      }
+
+      const del = async (row) => {
+        const label = row.title === '' ? '第' + String(row.chapter) + '章' : row.title
+        if (!window.confirm('删除「' + label + '」？\n\n正文会移到回收站，能找回；剧情总结也会一起移走。')) return
+        setBusy(true)
+        try {
+          await rpc('chapter.delete', { chapter: row.chapter })
+          toast('已移入回收站：' + label)
+          onRefresh()
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+      /** 新建一章：章号自动取「最大章号 + 1」，建好直接进编辑器。 */
+      const createChapter = async () => {
+        try {
+          const d = await rpc('chapter.create', { title: String(newCh === null ? '' : newCh) })
+          toast('已新建：第' + String(d.chapter) + '章 ' + d.title)
+          setNewCh(null)
+          onRefresh()
+          void openChapter(d.chapter)
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+      /** 在末尾加一卷。 */
+      const addVolume = async () => {
+        try {
+          const d = await rpc('outline.addVolume', { name: String(newVol === null ? '' : newVol) })
+          toast('已加一卷：' + d.title)
+          setNewVol(null)
+          onRefresh()
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+      /** 保存卷名：写回大纲里「# 第X卷 卷名」那一行。 */
+      const saveVolume = async (g, raw) => {
+        const to = String(raw).trim()
+        if (to === '' || to === g.title) { setVolDraft(null); return }
+        try {
+          await rpc('outline.renameVolume', { from: g.title, to })
+          toast('卷名已改为：' + to)
+          setVolDraft(null)
+          onRefresh()
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+
+      if (editing !== null) {
+        return React.createElement(
+          'div',
+          { style: { position: 'relative', display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 } },
+          React.createElement(
+            'div',
+            { style: { display: 'flex', alignItems: 'center', gap: 9, padding: '0 0 10px', flexShrink: 0 } },
+            React.createElement(
+              'button',
+              {
+                onClick: () => {
+                  if (editing !== null && editing.text !== editing.before) {
+                    setAskBack(true)
+                    return
+                  }
+                  setEditing(null)
+                },
+                style: btn(),
+              },
+              '← 返回',
+            ),
+            React.createElement('div', { style: { fontWeight: 700, fontSize: 14 } }, '第' + String(editing.chapter) + '章 ' + String(editing.title)),
+            React.createElement(Chip, null, fmtChars(editing.text.replace(/\s/gu, '').length)),
+            editing.text !== editing.before
+              ? React.createElement(
+                  'span',
+                  { style: { fontSize: 11, padding: '1px 7px', borderRadius: 99, border: '1px solid ' + C.warn, background: C.warn, color: '#fff', fontWeight: 600 } },
+                  '● 未保存',
+                )
+              : React.createElement(Chip, { tone: C.ok }, '已保存'),
+            React.createElement('div', { style: { flex: 1 } }),
+            React.createElement('button', { onClick: () => void scrollBody('top'), style: { ...btn(), padding: '2px 9px', fontSize: 11 }, title: '跳到这一章的开头' }, '⤒ 顶'),
+            React.createElement('button', { onClick: () => void scrollBody('bottom'), style: { ...btn(), padding: '2px 9px', fontSize: 11 }, title: '跳到这一章的末尾' }, '⤓ 底'),
+            React.createElement(
+              'button',
+              {
+                onClick: async () => {
+                  try {
+                    const n = await copyText(editing.text)
+                    toast('已复制本章正文 ' + String(n) + ' 字')
+                  } catch (e) {
+                    toast(String(e.message || e))
+                  }
+                },
+                style: { ...btn(), padding: '2px 9px', fontSize: 11 },
+                title: '把本章正文整段复制到剪贴板',
+              },
+              '📋 复制',
+            ),
+            React.createElement(
+              'button',
+              {
+                onClick: async () => {
+                  try {
+                    const d = await revealPath(editing.path)
+                    if (d.opened !== true) toast('系统没打开，路径：' + d.path)
+                  } catch (e) {
+                    toast(String(e.message || e))
+                  }
+                },
+                style: { ...btn(), padding: '2px 9px', fontSize: 11 },
+                title: '在文件管理器里定位本章正文',
+              },
+              '📂 目录',
+            ),
+            React.createElement('button', { onClick: () => void save(), disabled: busy || editing.text === editing.before, style: btn('primary') }, busy ? '保存中…' : '保存'),
+          ),
+          React.createElement('textarea', {
+            ref: bodyRef,
+            value: editing.text,
+            onChange: (e) => setEditing({ ...editing, text: e.target.value }),
+            style: { ...areaStyle, flex: 1, minHeight: 0, resize: 'none', fontSize: readFS + 1, lineHeight: 2 },
+          }),
+          // 有未保存改动时点「← 返回」：就地弹这个，不依赖任何外层组件
+          askBack !== true
+            ? null
+            : React.createElement(
+                'div',
+                {
+                  style: {
+                    position: 'absolute',
+                    inset: 0,
+                    background: 'rgba(0,0,0,0.32)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    zIndex: 10,
+                  },
+                },
+                React.createElement(
+                  'div',
+                  {
+                    style: {
+                      width: 'min(400px, 90%)',
+                      background: C.card,
+                      color: C.text,
+                      border: '1px solid ' + C.border,
+                      borderRadius: 12,
+                      boxShadow: '0 20px 60px rgba(0,0,0,0.35)',
+                      padding: 18,
+                    },
+                  },
+                  React.createElement('div', { style: { fontSize: 13.5, fontWeight: 700, marginBottom: 6 } }, '⚠️ 第' + String(editing.chapter) + '章还有没保存的修改'),
+                  React.createElement(
+                    'div',
+                    { style: { fontSize: 11.5, color: C.sub, lineHeight: 1.8, marginBottom: 14 } },
+                    '离开会丢掉刚才改的内容（' + String(editing.text.replace(/\s/gu, '').length) + ' 字，原稿 ' + String(editing.before.replace(/\s/gu, '').length) + ' 字）。',
+                  ),
+                  React.createElement(
+                    'div',
+                    { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
+                    React.createElement('button', { onClick: () => setAskBack(false), style: btn() }, '取消'),
+                    React.createElement(
+                      'button',
+                      { onClick: () => { setAskBack(false); setEditing(null) }, style: btn('danger') },
+                      '不保存',
+                    ),
+                    React.createElement(
+                      'button',
+                      {
+                        onClick: async () => {
+                          setAskBack(false)
+                          await save()
+                        },
+                        disabled: busy,
+                        style: btn('primary'),
+                      },
+                      busy ? '保存中…' : '保存并离开',
+                    ),
+                  ),
+                ),
+              ),
+        )
+      }
+
+      const missingSummary = chapters.filter((c) => c.hasSummary !== true && c.chars > 0).length
+
+      return React.createElement(
+        'div',
+        { style: { height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0 } },
+        // 顶部工具条
+        React.createElement(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '0 0 9px', flexShrink: 0, flexWrap: 'wrap' } },
+          null,
+          null,
+          sumProgress === null
+            ? null
+            : React.createElement(Chip, { tone: C.accent }, '正在写第' + String(sumProgress.current) + '章 ' + String(sumProgress.done + 1) + '/' + String(sumProgress.total)),
+          React.createElement('div', { style: { flex: 1 } }),
+          newCh === null
+            ? React.createElement('button', { onClick: () => setNewCh(''), style: { ...btn('primary'), padding: '3px 10px', fontSize: 11.5 } }, '＋ 新建章节')
+            : React.createElement(
+                React.Fragment,
+                null,
+                React.createElement('input', {
+                  value: newCh,
+                  autoFocus: true,
+                  placeholder: '章节标题，例如：堡里的早晨',
+                  onChange: (e) => setNewCh(e.target.value),
+                  onKeyDown: (e) => {
+                    if (e.key === 'Enter') void createChapter()
+                    if (e.key === 'Escape') setNewCh(null)
+                  },
+                  style: { ...inputStyle, width: 190 },
+                }),
+                React.createElement('button', { onClick: () => void createChapter(), style: { ...btn('primary'), padding: '3px 10px', fontSize: 11.5, marginLeft: 6 } }, '确定'),
+                React.createElement('button', { onClick: () => setNewCh(null), style: { ...btn(), padding: '3px 10px', fontSize: 11.5, marginLeft: 6 } }, '取消'),
+              ),
+          newVol === null
+            ? React.createElement('button', { onClick: () => setNewVol(''), style: { ...btn(), padding: '3px 10px', fontSize: 11.5 } }, '＋ 添加卷')
+            : React.createElement(
+                React.Fragment,
+                null,
+                React.createElement('input', {
+                  value: newVol,
+                  autoFocus: true,
+                  placeholder: '新卷名，例如：安魂曲',
+                  onChange: (e) => setNewVol(e.target.value),
+                  onKeyDown: (e) => {
+                    if (e.key === 'Enter') void addVolume()
+                    if (e.key === 'Escape') setNewVol(null)
+                  },
+                  style: { ...inputStyle, width: 170 },
+                }),
+                React.createElement('button', { onClick: () => void addVolume(), style: { ...btn('primary'), padding: '3px 10px', fontSize: 11.5, marginLeft: 6 } }, '确定'),
+                React.createElement('button', { onClick: () => setNewVol(null), style: { ...btn(), padding: '3px 10px', fontSize: 11.5, marginLeft: 6 } }, '取消'),
+              ),
+        ),
+        React.createElement(
+          'div',
+          { style: { flex: 1, minHeight: 0, overflow: 'auto' } },
+        chapters.length === 0
+          ? React.createElement(Empty, null, '还没有章节。\n把正文放进「正文/」或「章节/」目录，文件名带「第N章」就会被认出来。')
+          : React.createElement(
+              'table',
+              { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12.5 } },
+              React.createElement(
+                'thead',
+                null,
+                React.createElement(
+                  'tr',
+                  null,
+                  ...['标题', '字数', '操作'].map((h, i) =>
+                    React.createElement(
+                      'th',
+                      {
+                        key: h,
+                        style: {
+                          textAlign: i === 1 ? 'right' : 'left',
+                          padding: '6px 8px',
+                          fontSize: 11,
+                          color: C.sub,
+                          fontWeight: 500,
+                          borderBottom: '1px solid ' + C.border,
+                          whiteSpace: 'nowrap',
+                        },
+                      },
+                      h,
+                    ),
+                  ),
+                ),
+              ),
+              React.createElement(
+                'tbody',
+                null,
+                ...groups.flatMap((g) => {
+                  const open = openVols[g.id] === true
+                  const volChars = g.rows.reduce((s, r) => s + (Number(r.chars) || 0), 0)
+                  const nums = g.rows.map((r) => Number(r.chapter)).filter((n) => Number.isFinite(n))
+                  const firstCh = nums.length === 0 ? null : Math.min(...nums)
+                  const lastCh = nums.length === 0 ? null : Math.max(...nums)
+                  const chRange = firstCh === null ? '' : firstCh === lastCh ? '（第' + String(firstCh) + '章）' : '（第' + String(firstCh) + '–' + String(lastCh) + '章）'
+                  const editingVol = volDraft !== null && volDraft.id === g.id
+                  const head = React.createElement(
+                    'tr',
+                    { key: 'v' + g.id, style: { background: C.rail } },
+                    editingVol
+                      ? React.createElement(
+                          'td',
+                          { style: { padding: '5px 8px', borderBottom: '1px solid ' + C.border } },
+                          React.createElement('input', {
+                            value: volDraft.value,
+                            autoFocus: true,
+                            onChange: (e) => setVolDraft({ id: g.id, value: e.target.value }),
+                            onKeyDown: (e) => {
+                              if (e.key === 'Enter') void saveVolume(g, volDraft.value)
+                              if (e.key === 'Escape') setVolDraft(null)
+                            },
+                            style: { ...inputStyle, width: '100%' },
+                          }),
+                        )
+                      : React.createElement(
+                          'td',
+                          { style: { padding: '7px 8px', fontSize: 12, fontWeight: 600, borderBottom: '1px solid ' + C.border, cursor: 'pointer' }, onClick: () => setOpenVols((prev) => ({ ...prev, [g.id]: !(prev[g.id] === true) })) },
+                          (open ? '▾ ' : '▸ ') + g.title + chRange,
+                        ),
+                    React.createElement('td', { style: { padding: '7px 8px', textAlign: 'right', color: C.sub, fontSize: 12, borderBottom: '1px solid ' + C.border } }, fmtChars(volChars)),
+                    editingVol
+                      ? React.createElement(
+                          'td',
+                          { style: { padding: '5px 8px', borderBottom: '1px solid ' + C.border, whiteSpace: 'nowrap' } },
+                          React.createElement('button', { onClick: () => void saveVolume(g, volDraft.value), style: { ...btn('primary'), padding: '2px 9px', fontSize: 11.5 } }, '保存'),
+                          React.createElement('button', { onClick: () => setVolDraft(null), style: { ...btn(), padding: '2px 9px', fontSize: 11.5, marginLeft: 6 } }, '取消'),
+                        )
+                      : React.createElement(
+                          'td',
+                          { style: { padding: '7px 8px', borderBottom: '1px solid ' + C.border, whiteSpace: 'nowrap' } },
+                          React.createElement('button', { onClick: () => setVolDraft({ id: g.id, value: g.title }), style: { ...btn(), padding: '2px 9px', fontSize: 11.5 } }, '编辑卷名'),
+                        ),
+                  )
+                  if (!open) return [head]
+                  return [head, ...g.rows.map((row) =>
+                    React.createElement(
+                      'tr',
+                      { key: 'c' + String(row.chapter) },
+                      React.createElement(
+                        'td',
+                        { style: { padding: '7px 8px', borderBottom: '1px solid ' + C.border } },
+                        React.createElement(
+                          'span',
+                          { onClick: () => void openChapter(row.chapter), style: { cursor: 'pointer', color: C.accent, borderBottom: '1px dashed ' + C.accent + '66' } },
+                          row.title === '' ? '第' + String(row.chapter) + '章' : row.title,
+                        ),
+                      ),
+                      React.createElement('td', { style: { padding: '7px 8px', textAlign: 'right', color: C.sub, borderBottom: '1px solid ' + C.border } }, fmtChars(row.chars)),
+                      React.createElement(
+                        'td',
+                        { style: { padding: '7px 8px', borderBottom: '1px solid ' + C.border, whiteSpace: 'nowrap' } },
+                        React.createElement('button', { onClick: () => void openChapter(row.chapter), disabled: busy, style: { ...btn(), padding: '2px 9px', fontSize: 11.5 } }, '编辑'),
+                        React.createElement('button', { onClick: () => void del(row), disabled: busy, style: { ...btn('danger'), padding: '2px 9px', fontSize: 11.5, marginLeft: 6 } }, '删除'),
+                      ),
+                    ),
+                  )]
+                }),
+              ),
+            ),
+        ),
+        // ── 剧情总结查看层 ──
+        sumView === null
+          ? null
+          : React.createElement(
+              'div',
+              {
+                style: {
+                  position: 'fixed',
+                  inset: 0,
+                  zIndex: 950,
+                  background: 'rgba(0,0,0,0.30)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  padding: 20,
+                },
+                onMouseDown: (e) => {
+                  if (e.target === e.currentTarget) setSumView(null)
+                },
+              },
+              React.createElement(
+                'div',
+                {
+                  style: {
+                    width: 'min(720px, 100%)',
+                    maxHeight: '100%',
+                    background: C.card,
+                    color: C.text,
+                    border: '1px solid ' + C.border,
+                    borderRadius: 12,
+                    boxShadow: '0 20px 60px rgba(0,0,0,0.35)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    overflow: 'hidden',
+                  },
+                },
+                React.createElement(
+                  'div',
+                  { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderBottom: '1px solid ' + C.border, flexShrink: 0, flexWrap: 'wrap' } },
+                  React.createElement('span', { style: { fontWeight: 700, fontSize: 13 } }, '📝 第' + String(sumView.chapter) + '章 剧情总结'),
+                  sumView.exists !== true ? React.createElement(Chip, { tone: C.warn }, '还没有') : null,
+                  sumView.editing === true && sumView.text !== sumView.before ? React.createElement(Chip, { tone: C.warn }, '未保存') : null,
+                  React.createElement('div', { style: { flex: 1 } }),
+                  sumView.editing === true
+                    ? React.createElement(
+                        React.Fragment,
+                        null,
+                        React.createElement('button', { onClick: () => setSumView({ ...sumView, text: sumView.before, editing: false }), style: { ...btn(), padding: '3px 10px', fontSize: 11.5 } }, '取消'),
+                        React.createElement('button', { onClick: () => void saveSummary(), disabled: sumView.text === sumView.before, style: { ...btn('primary'), marginLeft: 6 } }, '保存'),
+                      )
+                    : React.createElement(
+                        React.Fragment,
+                        null,
+                        sumView.exists === true
+                          ? React.createElement('button', { onClick: () => setSumView({ ...sumView, editing: true }), style: { ...btn(), padding: '3px 10px', fontSize: 11.5 } }, '✎ 手改')
+                          : null,
+                        React.createElement(
+                          'button',
+                          {
+                            onClick: () => {
+                              if (sumView.exists === true && !window.confirm('重写第' + String(sumView.chapter) + '章的总结？旧总结会备份。')) return
+                              void genSummary({ chapter: sumView.chapter }, sumView.exists === true).then(async () => {
+                                try {
+                                  const d = await rpc('summary.get', { chapter: sumView.chapter })
+                                  setSumView({ chapter: sumView.chapter, text: d.text, before: d.text, exists: d.exists, editing: false })
+                                } catch {
+                                  // 刷新失败就留着旧内容，不打断
+                                }
+                              })
+                            },
+                            disabled: sumBusy !== '',
+                            style: { ...btn(), marginLeft: 6, padding: '3px 10px', fontSize: 11.5, color: C.accent, borderColor: C.accent + '66' },
+                          },
+                          sumBusy !== '' ? '生成中…' : sumView.exists === true ? '⟳ 重写' : '✨ 生成',
+                        ),
+                        React.createElement('button', { onClick: () => setSumView(null), style: { ...btn(), marginLeft: 6, padding: '3px 10px', fontSize: 11.5 } }, '关闭'),
+                      ),
+                ),
+                sumView.editing === true
+                  ? React.createElement('textarea', {
+                      value: sumView.text,
+                      onChange: (e) => setSumView({ ...sumView, text: e.target.value }),
+                      style: { flex: 1, minHeight: 400, resize: 'none', border: 'none', outline: 'none', padding: '12px 14px', fontSize: 12.5, lineHeight: 1.9, background: 'transparent', color: C.text, fontFamily: 'inherit' },
+                    })
+                  : React.createElement(
+                      'div',
+                      { style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '12px 14px', fontSize: 12.5, lineHeight: 1.9, whiteSpace: 'pre-wrap' } },
+                      sumView.exists !== true
+                        ? React.createElement('div', { style: { color: C.sub } }, '这一章还没有剧情总结。点上面的「✨ 生成」，让模型读正文写一份。')
+                        : sumView.text,
+                    ),
+              ),
+            ),
+      )
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // 候选稿页
+    // ══════════════════════════════════════════════════════════
+    function DraftsPage({ state, onRefresh, toast }) {
+      // 阅读字号：设置里可调，默认 12.5
+      const readFS =
+        state !== null && state.config !== undefined && state.config.readFontSize !== undefined
+          ? Number(state.config.readFontSize)
+          : 12.5
+      const [groups, setGroups] = useState([])
+      const [loading, setLoading] = useState(true)
+      const [tabs, setTabs] = useState([])
+      const [activeKey, setActiveKey] = useState('')
+      const [sel, setSel] = useState({})
+      const [busy, setBusy] = useState(false)
+      // ── 开新章向导 ──
+      const [wiz, setWiz] = useState(null) // null=关闭；否则是向导状态对象
+      const abortRef = useRef(false)
+      /** 右侧阅读区的滚动容器，用来在换稿时回顶 */
+      const readerRef = useRef(null)
+
+      const openWizard = async () => {
+        const next = state !== null && state.totals !== undefined ? Number(state.totals.chapters || 0) + 1 : 1
+        setWiz({ step: 1, chapter: next, setupText: '', dirCount: 8, extra: '', directions: [], picked: {}, progress: { done: 0, total: 0, current: '' }, notice: '', running: false, briefOpen: true, briefRefresh: 0, briefWidth: 460 })
+        try {
+          const st = await rpc('newchapter.status', { chapter: next })
+          setWiz((cur) => (cur === null ? cur : { ...cur, setupText: st.setupText, existed: st.candidates }))
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+      /** 把「下一章往哪写」的一条建议填进额外要求（不覆盖已写的内容） */
+      const fillExtra = (text) => {
+        const line = String(text || '').trim()
+        if (line === '') return
+        setWiz((cur) => {
+          if (cur === null) return cur
+          const base = String(cur.extra || '').trim()
+          if (base.includes(line)) return cur
+          return { ...cur, extra: base === '' ? line : base + '\n' + line }
+        })
+        toast('已填进「额外要求」')
+      }
+
+      const closeWizard = () => {
+        abortRef.current = true
+        setWiz(null)
+      }
+
+      const wizPatch = (patch) => setWiz((cur) => (cur === null ? cur : { ...cur, ...patch }))
+
+      const wizChapter = async (n) => {
+        const chapter = Number(n) || 1
+        wizPatch({ chapter })
+        try {
+          const st = await rpc('newchapter.status', { chapter })
+          wizPatch({ setupText: st.setupText, existed: st.candidates })
+        } catch {
+          // 读不到就留着现在的设定，不影响继续
+        }
+      }
+
+      /**
+       * 让模型去书里找：大纲（本章原样字段 + 前后章）、细纲（本章那段）、设定、人物卡、
+       * 台账、上一章总结，翻一遍拼成「本章设定」填进输入框。只搬运，不规划。
+       */
+      const wizSetupDraft = async () => {
+        if (wiz === null) return
+        const cur = String(wiz.setupText || '')
+        const looksEmpty = cur.trim() === '' || cur.includes('这里写「这一章要干什么」')
+        if (!looksEmpty && !window.confirm('这一章已经写了设定。\n\n要用模型从书里找到的内容替换掉吗？（原内容不会另存，想留就先复制一份）')) return
+        wizPatch({ setupBusy: true, notice: '正在翻大纲、细纲、设定和人物卡…' })
+        try {
+          const d = await rpc('newchapter.setupDraft', { chapter: wiz.chapter })
+          // 顺手让右侧体检重算：生成的内容已经落盘，不刷新的话它还会说"本章设定还是空的"
+          wizPatch({ setupText: d.text, setupBusy: false, notice: d.notice, briefRefresh: (wiz.briefRefresh || 0) + 1 })
+        } catch (e) {
+          wizPatch({ setupBusy: false, notice: String(e.message || e) })
+        }
+      }
+
+      /** 清空本章设定：连落盘的那份一起删，回到最开始那份空模板（体检随后又会说"本章设定还是空的"） */
+      const wizSetupClear = async () => {
+        if (wiz === null) return
+        const cur = String(wiz.setupText || '')
+        const looksEmpty = cur.trim() === '' || cur.includes('这里写「这一章要干什么」')
+        if (!looksEmpty && !window.confirm('清空本章设定？\n\n会删掉已经保存的这份（想再要回来，可以点「🔍 让模型去书里找」重新生成）。')) return
+        wizPatch({ setupBusy: true, notice: '清空中…' })
+        try {
+          const d = await rpc('setup.reset', { chapter: wiz.chapter })
+          wizPatch({ setupText: d.text, setupBusy: false, notice: '已清空，回到最开始的样子', briefRefresh: (wiz.briefRefresh || 0) + 1 })
+        } catch (e) {
+          wizPatch({ setupBusy: false, notice: String(e.message || e) })
+        }
+      }
+
+      const wizDirections = async () => {
+        if (wiz === null) return
+        wizPatch({ running: true, notice: '正在让模型给方向…' })
+        try {
+          const d = await rpc('newchapter.directions', { chapter: wiz.chapter, count: wiz.dirCount, extra: wiz.extra, setupText: wiz.setupText })
+          const picked = {}
+          for (const x of d.directions) picked[x.index] = true
+          wizPatch({
+            step: 2,
+            directions: d.directions,
+            picked,
+            packInfo: d.packInfo,
+            running: false,
+            notice: '方向来自 ' + String(d.model) + '（写作包 ' + String(d.packChars) + ' 字）',
+          })
+        } catch (e) {
+          wizPatch({ running: false, notice: String(e.message || e) })
+        }
+      }
+
+      const wizWrite = async () => {
+        if (wiz === null) return
+        const chosen = wiz.directions.filter((x) => wiz.picked[x.index] === true)
+        if (chosen.length === 0) {
+          wizPatch({ notice: '一个方向都没勾' })
+          return
+        }
+        abortRef.current = false
+        wizPatch({ step: 3, running: true, notice: '', progress: { done: 0, total: chosen.length, current: '' } })
+        const others = wiz.directions.filter((x) => wiz.picked[x.index] !== true).map((x) => x.name)
+        let done = 0
+        for (const dir of chosen) {
+          if (abortRef.current) break
+          wizPatch({ progress: { done, total: chosen.length, current: dir.name } })
+          try {
+            await rpc('newchapter.draft', { chapter: wiz.chapter, direction: dir, index: dir.index, others, setupText: wiz.setupText, extra: wiz.extra })
+            done += 1
+            wizPatch({ progress: { done, total: chosen.length, current: dir.name } })
+          } catch (e) {
+            wizPatch({ notice: '「' + String(dir.name) + '」没写成：' + String(e.message || e) })
+          }
+        }
+        wizPatch({ running: false, step: 4, progress: { done, total: chosen.length, current: '' } })
+        await load()
+      }
+
+      const load = useCallback(async () => {
+        setLoading(true)
+        try {
+          const d = await rpc('drafts.list')
+          setGroups(d.groups || [])
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setLoading(false)
+        }
+      }, [toast])
+
+      useEffect(() => {
+        void load()
+      }, [load])
+
+      // 顶栏刷新时也重读回收站
+      useEffect(() => {
+        const h = () => {
+          void load()
+        }
+        window.addEventListener('novel-studio:refresh', h)
+        return () => window.removeEventListener('novel-studio:refresh', h)
+      }, [load])
+
+      /**
+       * 换一篇候选稿时把阅读区拉回顶部。
+       * 阅读器只有一套滚动容器，不重置就会继承上一篇「滚到底」的位置，
+       * 表现为刚点开新稿却停在末尾。
+       */
+      useEffect(() => {
+        const el = readerRef.current
+        if (el !== null && el !== undefined) el.scrollTop = 0
+      }, [activeKey])
+
+      /** 'top' 回顶；'bottom' 到底 */
+      const scrollReader = (where) => {
+        const el = readerRef.current
+        if (el === null || el === undefined) return
+        el.scrollTop = where === 'top' ? 0 : el.scrollHeight
+      }
+
+      const active = tabs.find((x) => x.key === activeKey) || null
+      const keyOf = (chapter, name) => String(chapter) + '|' + name
+
+      const openTab = async (chapter, name) => {
+        const key = keyOf(chapter, name)
+        if (tabs.some((x) => x.key === key)) {
+          setActiveKey(key)
+          return
+        }
+        setBusy(true)
+        try {
+          const d = await rpc('draft.read', { chapter, name })
+          setTabs((prev) => [...prev, { key, chapter, name, path: d.path, segments: d.segments, segMarks: d.segMarks, segPicks: d.segPicks, chars: d.chars }])
+          setActiveKey(key)
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const closeTab = (key) => {
+        setTabs((prev) => {
+          const next = prev.filter((x) => x.key !== key)
+          if (activeKey === key) setActiveKey(next.length === 0 ? '' : next[next.length - 1].key)
+          return next
+        })
+      }
+
+      /** 勾/取消一段进合稿。和 👍/👎 完全分开。 */
+      const pickSeg = async (tab, index, picked) => {
+        try {
+          const d = await rpc('draft.pick', { chapter: tab.chapter, name: tab.name, index, picked })
+          setTabs((prev) => prev.map((x) => (x.key === tab.key ? { ...x, segPicks: d.segPicks } : x)))
+          setGroups((prev) =>
+            prev.map((g) => ({
+              ...g,
+              items: g.items.map((it) => (it.name === tab.name && g.chapter === tab.chapter ? { ...it, picked: d.pickCount } : it)),
+            })),
+          )
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+      /** 一篇候选稿：全勾 / 全不勾进合稿 */
+      const pickWhole = async (tab, picked) => {
+        try {
+          const d = await rpc('draft.pickAll', { chapter: tab.chapter, name: tab.name, picked })
+          setTabs((prev) => prev.map((x) => (x.key === tab.key ? { ...x, segPicks: d.segPicks } : x)))
+          setGroups((prev) =>
+            prev.map((g) => ({
+              ...g,
+              items: g.items.map((it) => (it.name === tab.name && g.chapter === tab.chapter ? { ...it, picked: d.pickCount } : it)),
+            })),
+          )
+          toast(picked ? '本篇 ' + String(d.count) + ' 段已勾进合稿' : '已全部取消勾选')
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+      const markSeg = async (tab, index, mark) => {
+        const cur = tab.segMarks[index]
+        const next = cur === mark ? null : mark
+        try {
+          const d = await rpc('draft.mark', { chapter: tab.chapter, name: tab.name, index, mark: next })
+          setTabs((prev) => prev.map((x) => (x.key === tab.key ? { ...x, segMarks: d.segMarks } : x)))
+          setGroups((prev) =>
+            prev.map((g) => ({
+              ...g,
+              items: g.items.map((it) => (it.name === tab.name && g.chapter === tab.chapter ? { ...it, good: d.goodCount, bad: d.badCount, marked: d.goodCount + d.badCount } : it)),
+            })),
+          )
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+      const markWhole = async (tab, mark) => {
+        try {
+          const d = await rpc('draft.mark', { chapter: tab.chapter, name: tab.name, whole: true, mark })
+          setTabs((prev) => prev.map((x) => (x.key === tab.key ? { ...x, segMarks: d.segMarks } : x)))
+          await load()
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+      const merge = async (tab) => {
+        if (!window.confirm('把第' + String(tab.chapter) + '章里**勾选**的段落按顺序拼起来，写入正文？\n\n勾选＝这一段进合稿；👍/👎 只影响偏好档案，不参与合稿。\n原稿会自动备份。')) return
+        setBusy(true)
+        try {
+          const d = await rpc('draft.merge', { chapter: tab.chapter })
+          const fileName = String(d.path === undefined ? '' : d.path).split(/[\\/]/u).pop()
+          toast(
+            (d.created === true ? '已新建正文 ' : '已写入 ') +
+              fileName +
+              '：' +
+              String(d.chars) +
+              ' 字（' +
+              String(d.picked) +
+              ' 段）' +
+              (d.backup ? '，原稿已备份' : ''),
+          )
+          onRefresh()
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const delChecked = async () => {
+        const items = []
+        for (const g of groups) for (const it of g.items) if (sel[keyOf(g.chapter, it.name)] === true) items.push({ chapter: g.chapter, name: it.name })
+        if (items.length === 0) return
+        // 按章列出将删多少篇——全选是跨章生效的，别让人以为只清当前这一章
+        const byChapter = new Map()
+        for (const it of items) byChapter.set(it.chapter, (byChapter.get(it.chapter) || 0) + 1)
+        const detail = [...byChapter.entries()]
+          .sort((a, b) => a[0] - b[0])
+          .map(([ch, n]) => '第' + String(ch) + '章 ' + String(n) + ' 篇')
+          .join(' · ')
+        if (!window.confirm('删除选中的 ' + String(items.length) + ' 篇候选稿？\n\n' + detail + '\n\n会移入回收站的「候选稿」分区，能找回。')) return
+        setBusy(true)
+        try {
+          const d = await rpc('drafts.delete', { items })
+          const killed = new Set(items.map((x) => keyOf(x.chapter, x.name)))
+          setTabs((prev) => prev.filter((x) => !killed.has(x.key)))
+          setSel({})
+          toast('已删除 ' + String(d.movedCount) + ' 篇')
+          await load()
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const selCount = Object.keys(sel).filter((k) => sel[k] === true).length
+
+      // ── 批量勾选（删除用）─────────────────────────────────
+      /** 一组（一章）里所有候选稿的 key */
+      const keysOfGroup = (g) => g.items.map((it) => keyOf(g.chapter, it.name))
+      /** 全部候选稿的 key */
+      const allKeys = () => {
+        const out = []
+        for (const g of groups) for (const k of keysOfGroup(g)) out.push(k)
+        return out
+      }
+      const groupAllOn = (g) => {
+        const ks = keysOfGroup(g)
+        return ks.length > 0 && ks.every((k) => sel[k] === true)
+      }
+      const allOn = () => {
+        const ks = allKeys()
+        return ks.length > 0 && ks.every((k) => sel[k] === true)
+      }
+      /** on=true 全选这一章；false 取消这一章 */
+      const setGroupSel = (g, on) => {
+        const next = { ...sel }
+        for (const k of keysOfGroup(g)) {
+          if (on === true) next[k] = true
+          else delete next[k]
+        }
+        setSel(next)
+      }
+      /** on=true 全选所有章；false 全部取消 */
+      const setAllSel = (on) => {
+        if (on !== true) {
+          setSel({})
+          return
+        }
+        const next = {}
+        for (const k of allKeys()) next[k] = true
+        setSel(next)
+      }
+
+      return React.createElement(
+        'div',
+        { style: { position: 'relative', display: 'flex', height: '100%', minHeight: 0, gap: 12 } },
+        // 左：候选稿列表
+        React.createElement(
+          'div',
+          { style: { width: 320, flexShrink: 0, display: 'flex', flexDirection: 'column', minHeight: 0, ...cardStyle } },
+          React.createElement(
+            'div',
+            { style: { display: 'flex', alignItems: 'center', gap: 6, padding: '8px 10px', borderBottom: '1px solid ' + C.border, flexShrink: 0 } },
+            React.createElement('span', { style: { fontSize: 12, fontWeight: 600 } }, '候选稿'),
+            React.createElement('span', { style: { fontSize: 10.5, color: C.sub } }, '共 ' + String(groups.reduce((s, g) => s + g.items.length, 0)) + ' 篇'),
+            React.createElement('div', { style: { flex: 1 } }),
+            React.createElement('button', { onClick: () => void openWizard(), disabled: busy, style: { ...btn('primary'), padding: '3px 9px', fontSize: 11 } }, '✍️ 开新章'),
+            React.createElement('button', { onClick: () => void load(), disabled: busy, style: { ...btn(), padding: '2px 8px', fontSize: 11 } }, '↻'),
+          ),
+          React.createElement(
+            'div',
+            { style: { flex: 1, minHeight: 0, overflow: 'auto' } },
+            loading
+              ? React.createElement('div', { style: { padding: 14, color: C.sub, fontSize: 12 } }, '读取中…')
+              : groups.length === 0
+                ? React.createElement('div', { style: { padding: 14, color: C.sub, fontSize: 12, lineHeight: 1.8 } }, '还没有候选稿。\n在设置里设好候选目录后，用「开新章」生成。')
+                : groups.map((g) =>
+                    React.createElement(
+                      'div',
+                      { key: 'g' + String(g.chapter) },
+                      React.createElement(
+                        'div',
+                        { style: { padding: '6px 10px', fontSize: 11, fontWeight: 600, color: C.sub, background: C.rail, borderBottom: '1px solid ' + C.border, display: 'flex', alignItems: 'center', gap: 6 } },
+                        React.createElement('input', {
+                          type: 'checkbox',
+                          checked: groupAllOn(g),
+                          onChange: (e) => setGroupSel(g, e.target.checked),
+                          title: '勾选＝选中这一章的全部候选稿（待删除）',
+                          style: { margin: 0 },
+                        }),
+                        React.createElement('span', null, '第' + String(g.chapter) + '章 · ' + String(g.items.length) + ' 篇'),
+                      ),
+                      ...g.items.map((it) => {
+                        const key = keyOf(g.chapter, it.name)
+                        const isOpen = tabs.some((x) => x.key === key)
+                        return React.createElement(
+                          'div',
+                          {
+                            key: it.name,
+                            style: {
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 6,
+                              padding: '6px 10px',
+                              borderBottom: '1px solid ' + C.border,
+                              background: activeKey === key ? 'rgba(10,132,255,0.09)' : 'transparent',
+                            },
+                          },
+                          React.createElement('input', {
+                            type: 'checkbox',
+                            checked: sel[key] === true,
+                            onChange: (e) => setSel({ ...sel, [key]: e.target.checked }),
+                            title: '勾选＝待删除',
+                          }),
+                          React.createElement(
+                            'div',
+                            {
+                              onDoubleClick: () => void openTab(g.chapter, it.name),
+                              onClick: () => {
+                                if (isOpen) setActiveKey(key)
+                              },
+                              title: '双击打开',
+                              style: {
+                                flex: 1,
+                                minWidth: 0,
+                                fontSize: 11.5,
+                                cursor: 'pointer',
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                                whiteSpace: 'nowrap',
+                                color: isOpen ? C.accent : 'inherit',
+                              },
+                            },
+                            it.name,
+                          ),
+                          it.good > 0 ? React.createElement(Chip, { tone: C.ok }, '👍' + String(it.good)) : null,
+                          it.bad > 0 ? React.createElement(Chip, { tone: C.danger }, '👎' + String(it.bad)) : null,
+                        )
+                      }),
+                    ),
+                  ),
+          ),
+          React.createElement(
+            'div',
+            { style: { display: 'flex', alignItems: 'center', gap: 7, padding: '7px 10px', borderTop: '1px solid ' + C.border, flexShrink: 0 } },
+            React.createElement(
+              'button',
+              {
+                onClick: () => setAllSel(allOn() !== true),
+                disabled: busy || groups.length === 0,
+                title: allOn() === true ? '取消全部勾选' : '勾选全部候选稿',
+                style: { ...btn(), padding: '2px 8px', fontSize: 11 },
+              },
+              allOn() === true ? '取消全选' : '全选全部（' + String(allKeys().length) + '）',
+            ),
+            React.createElement('span', { style: { flex: 1, fontSize: 11, color: C.sub } }, selCount === 0 ? '未勾选' : '已勾选 ' + String(selCount) + ' 篇'),
+            React.createElement('button', { onClick: () => void delChecked(), disabled: busy || selCount === 0, style: { ...btn('danger'), padding: '3px 9px', fontSize: 11.5 } }, '🗑 删除'),
+          ),
+        ),
+        // 右：阅读器
+        React.createElement(
+          'div',
+          { style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0, position: 'relative', ...cardStyle } },
+          React.createElement(
+            'div',
+            { style: { display: 'flex', alignItems: 'center', gap: 4, padding: '6px 10px', borderBottom: '1px solid ' + C.border, overflowX: 'auto', flexShrink: 0, minHeight: 38 } },
+            tabs.length === 0
+              ? React.createElement('span', { style: { color: C.sub, fontSize: 11.5 } }, '双击左边的文件名打开，可同时开多篇')
+              : tabs.map((x) =>
+                  React.createElement(
+                    'div',
+                    {
+                      key: x.key,
+                      onClick: () => setActiveKey(x.key),
+                      style: {
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 5,
+                        padding: '3px 8px',
+                        borderRadius: 7,
+                        border: '1px solid ' + (activeKey === x.key ? C.accent : C.border),
+                        background: activeKey === x.key ? 'rgba(10,132,255,0.09)' : 'transparent',
+                        fontSize: 11,
+                        whiteSpace: 'nowrap',
+                        cursor: 'pointer',
+                      },
+                    },
+                    React.createElement('span', { style: { color: activeKey === x.key ? C.accent : C.sub } }, x.name.replace(/\.txt$/iu, '')),
+                    React.createElement('span', { onClick: (e) => { e.stopPropagation(); closeTab(x.key) }, style: { color: C.sub, fontWeight: 700, padding: '0 2px' } }, '×'),
+                  ),
+                ),
+          ),
+          active === null
+            ? null
+            : React.createElement(
+                'div',
+                { style: { display: 'flex', alignItems: 'center', gap: 7, padding: '6px 10px', borderBottom: '1px solid ' + C.border, flexShrink: 0, flexWrap: 'wrap' } },
+                React.createElement('span', { style: { fontSize: 11, color: C.sub } }, String(active.segments.length) + ' 段　👍' + String(active.segMarks.filter((m) => m === 'good').length) + '　👎' + String(active.segMarks.filter((m) => m === 'bad').length)),
+                React.createElement('div', { style: { flex: 1 } }),
+                React.createElement('button', { onClick: () => void pickWhole(active, true), disabled: busy, style: { ...btn(), padding: '2px 8px', fontSize: 11 }, title: '把本篇所有段都勾进合稿' }, '☑ 全勾本篇'),
+                React.createElement('button', { onClick: () => void pickWhole(active, false), disabled: busy, style: { ...btn(), padding: '2px 8px', fontSize: 11 }, title: '取消本篇所有勾选' }, '☐ 全不勾'),
+                React.createElement('button', { onClick: () => void markWhole(active, null), disabled: busy, style: { ...btn(), padding: '2px 8px', fontSize: 11 } }, '清空'),
+                // 一键到顶 / 到底：放工具栏里，不压在正文上
+                React.createElement('button', { onClick: () => scrollReader('top'), style: { ...btn(), padding: '2px 8px', fontSize: 11 }, title: '跳到这篇的开头' }, '⤒ 顶'),
+                React.createElement('button', { onClick: () => scrollReader('bottom'), style: { ...btn(), padding: '2px 8px', fontSize: 11 }, title: '跳到这篇的末尾' }, '⤓ 底'),
+                React.createElement(
+                  'button',
+                  {
+                    onClick: async () => {
+                      try {
+                        const n = await copyText(active.segments.join('\n\n'))
+                        toast('已复制本篇 ' + String(n) + ' 字')
+                      } catch (e) {
+                        toast(String(e.message || e))
+                      }
+                    },
+                    style: { ...btn(), padding: '2px 8px', fontSize: 11 },
+                    title: '把这篇候选稿整段复制到剪贴板（分享给别人用这个）',
+                  },
+                  '📋 复制',
+                ),
+                React.createElement(
+                  'button',
+                  {
+                    onClick: async () => {
+                      try {
+                        const d = await revealPath(active.path)
+                        if (d.opened !== true) toast('系统没打开，路径：' + d.path)
+                      } catch (e) {
+                        toast(String(e.message || e))
+                      }
+                    },
+                    style: { ...btn(), padding: '2px 8px', fontSize: 11 },
+                    title: '在文件管理器里定位这篇候选稿',
+                  },
+                  '📂 目录',
+                ),
+                React.createElement('button', { onClick: () => void merge(active), disabled: busy, style: btn('primary') }, '📕 合稿定稿'),
+              ),
+          React.createElement(
+            'div',
+            {
+              ref: readerRef,
+              style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '8px 12px' },
+            },
+            active === null
+              ? null
+              : active.segments.map((seg, i) => {
+                  const mk = active.segMarks[i]
+                  const pk = active.segPicks !== undefined && active.segPicks[i] === true
+                  const bg = mk === 'good' ? 'rgba(52,199,89,0.13)' : mk === 'bad' ? 'rgba(255,59,48,0.11)' : 'transparent'
+                  // 勾进合稿的段左边竖条用蓝色，和 👍 的绿区分开
+                  const bar = pk ? C.accent : mk === 'good' ? C.ok : mk === 'bad' ? C.danger : 'transparent'
+                  return React.createElement(
+                    'div',
+                    {
+                      key: 's' + String(i),
+                      style: { display: 'flex', gap: 7, padding: '5px 7px', marginBottom: 2, borderRadius: 6, background: bg, borderLeft: '3px solid ' + bar },
+                    },
+                    React.createElement(
+                      'button',
+                      {
+                        onClick: () => void pickSeg(active, i, !pk),
+                        title: pk ? '已勾进合稿（点掉就不进）' : '勾上：这段进合稿',
+                        style: {
+                          flexShrink: 0,
+                          width: 15,
+                          height: 15,
+                          marginTop: 4,
+                          padding: 0,
+                          borderRadius: 4,
+                          border: '1.5px solid ' + (pk ? C.accent : C.border),
+                          background: pk ? C.accent : 'transparent',
+                          color: '#fff',
+                          fontSize: 10,
+                          lineHeight: 1,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          cursor: 'pointer',
+                          transition: 'background 0.12s, border-color 0.12s',
+                        },
+                      },
+                      pk ? '✓' : '',
+                    ),
+                    React.createElement('span', { style: { color: C.sub, fontSize: 10, flexShrink: 0, paddingTop: 3, minWidth: 20, textAlign: 'right' } }, String(i + 1)),
+                    React.createElement('div', { style: { flex: 1, minWidth: 0, fontSize: readFS, lineHeight: 1.9, whiteSpace: 'pre-wrap' } }, seg),
+                    React.createElement(
+                      'div',
+                      { style: { display: 'flex', gap: 3, flexShrink: 0 } },
+                      React.createElement(
+                        'button',
+                        {
+                          onClick: () => void markSeg(active, i, 'good'),
+                          title: mk === 'good' ? '取消' : '标为好',
+                          style: {
+                            border: '1px solid ' + (mk === 'good' ? C.ok : C.border),
+                            background: mk === 'good' ? C.ok : 'transparent',
+                            color: mk === 'good' ? '#fff' : C.sub,
+                            borderRadius: 6,
+                            padding: '1px 5px',
+                            fontSize: 11,
+                            cursor: 'pointer',
+                          },
+                        },
+                        '👍',
+                      ),
+                      React.createElement(
+                        'button',
+                        {
+                          onClick: () => void markSeg(active, i, 'bad'),
+                          title: mk === 'bad' ? '取消' : '标为不好',
+                          style: {
+                            border: '1px solid ' + (mk === 'bad' ? C.danger : C.border),
+                            background: mk === 'bad' ? C.danger : 'transparent',
+                            color: mk === 'bad' ? '#fff' : C.sub,
+                            borderRadius: 6,
+                            padding: '1px 5px',
+                            fontSize: 11,
+                            cursor: 'pointer',
+                          },
+                        },
+                        '👎',
+                      ),
+                    ),
+                  )
+                }),
+          ),
+        ),
+        // ── 开新章向导（覆盖层，不离开本页，状态不会丢）──
+        wiz === null
+          ? null
+          : React.createElement(
+              'div',
+              {
+                style: {
+                  position: 'absolute',
+                  inset: 0,
+                  background: 'rgba(0,0,0,0.30)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  zIndex: 5,
+                },
+                onMouseDown: (e) => {
+                  if (e.target === e.currentTarget && wiz.running !== true) closeWizard()
+                },
+              },
+              React.createElement(
+                'div',
+                {
+                  style: {
+                    width: wiz.briefOpen === false ? 'min(760px, 100%)' : 'min(' + String(360 + (wiz.briefWidth || 460) + 36) + 'px, 100%)',
+                    height: 'min(780px, calc(100vh - 32px))',
+                    maxHeight: '100%',
+                    background: C.card,
+                    border: '1px solid ' + C.border,
+                    borderRadius: 12,
+                    boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    overflow: 'hidden',
+                  },
+                },
+                // 标题 + 步骤
+                React.createElement(
+                  'div',
+                  { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderBottom: '1px solid ' + C.border, flexShrink: 0 } },
+                  React.createElement('span', { style: { fontWeight: 700, fontSize: 13 } }, '✍️ 开新章'),
+                  ...['这一章写什么', '方向', '写候选', '完成'].map((label, i) =>
+                    React.createElement(
+                      'span',
+                      {
+                        key: 'st' + String(i),
+                        style: {
+                          fontSize: 11,
+                          padding: '1px 8px',
+                          borderRadius: 99,
+                          border: '1px solid ' + (wiz.step === i + 1 ? C.accent : C.border),
+                          color: wiz.step === i + 1 ? C.accent : C.sub,
+                        },
+                      },
+                      String(i + 1) + ' ' + label,
+                    ),
+                  ),
+                  React.createElement('div', { style: { flex: 1 } }),
+                  React.createElement(
+                    'button',
+                    {
+                      onClick: () => wizPatch({ briefOpen: wiz.briefOpen === false }),
+                      title: wiz.briefOpen === false ? '展开右侧的开章体检' : '收起右侧，窗口变窄',
+                      style: {
+                        ...btn(),
+                        padding: '2px 9px',
+                        fontSize: 11.5,
+                        ...(wiz.briefOpen === false ? { borderColor: C.accent, color: C.accent, fontWeight: 700 } : {}),
+                      },
+                    },
+                    wiz.briefOpen === false ? '▸ 展开体检' : '▾ 收起体检',
+                  ),
+                  React.createElement(
+                    'button',
+                    { onClick: () => closeWizard(), disabled: wiz.running === true, style: { ...btn(), padding: '2px 9px', fontSize: 11.5 } },
+                    wiz.running === true ? '写稿中…' : '关闭',
+                  ),
+                ),
+                // 主体：左向导 + 右开章体检（窗口不够宽时自动上下堆叠）
+                React.createElement(
+                  'div',
+                  {
+                    style: {
+                      flex: '1 1 0',
+                      minHeight: 0,
+                      display: 'flex',
+                      flexWrap: 'nowrap',
+                      alignItems: 'stretch',
+                      overflow: 'hidden',
+                    },
+                  },
+                  // 左：向导内容
+                  React.createElement(
+                  'div',
+                  {
+                    style: {
+                      flex: '1 1 auto',
+                      minWidth: 360,
+                      padding: 14,
+                      alignSelf: 'stretch',
+                      minHeight: 0,
+                      overflowY: 'auto',
+                      overscrollBehavior: 'contain',
+                      boxSizing: 'border-box',
+                    },
+                  },
+                  // 第一步
+                  wiz.step === 1
+                    ? React.createElement(
+                        'div',
+                        null,
+                        React.createElement('div', { style: { fontSize: 11.5, color: C.sub, marginBottom: 4 } }, '章号'),
+                        React.createElement('input', {
+                          type: 'number',
+                          value: wiz.chapter,
+                          min: 1,
+                          onChange: (e) => void wizChapter(e.target.value),
+                          style: { ...inputStyle, width: 100 },
+                        }),
+                        wiz.existed > 0 ? React.createElement('span', { style: { fontSize: 11, color: C.warn, marginLeft: 8 } }, '这一章已有 ' + String(wiz.existed) + ' 篇候选稿') : null,
+                        React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, margin: '12px 0 4px', flexWrap: 'wrap' } },
+                          React.createElement('div', { style: { fontSize: 11.5, color: C.sub } }, '本章设定（会进写作包第①节，也是写候选的依据）'),
+                          React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' } },
+                            React.createElement(
+                              'button',
+                              {
+                                onClick: () => void wizSetupClear(),
+                                disabled: wiz.setupBusy === true,
+                                title: '删掉这份本章设定，回到最开始那份空模板（体检也会跟着回到「还没写」）',
+                                style: { ...btn(), padding: '1px 9px', fontSize: 11 },
+                              },
+                              '清空',
+                            ),
+                            React.createElement(
+                              'button',
+                              {
+                                onClick: () => void wizSetupDraft(),
+                                disabled: wiz.setupBusy === true,
+                                title: '去 大纲 / 细纲 / 设定 / 人物卡 / 台账 里找跟这一章有关的东西，整理成本章设定',
+                                style: { ...btn(), padding: '1px 9px', fontSize: 11, color: C.accent, borderColor: C.accent + '55' },
+                              },
+                              wiz.setupBusy === true ? '正在翻书…' : '🔍 让模型去书里找',
+                            ),
+                          ),
+                        ),
+                        React.createElement('textarea', {
+                          value: wiz.setupText,
+                          onChange: (e) => wizPatch({ setupText: e.target.value }),
+                          rows: 10,
+                          style: { ...areaStyle, fontSize: 12 },
+                        }),
+                        React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 12, flexWrap: 'wrap' } },
+                          React.createElement('span', { style: { fontSize: 11.5, color: C.sub } }, '要几个方向'),
+                          React.createElement('input', {
+                            type: 'number',
+                            value: wiz.dirCount,
+                            min: 3,
+                            max: 16,
+                            onChange: (e) => wizPatch({ dirCount: Number(e.target.value) }),
+                            style: { ...inputStyle, width: 80 },
+                          }),
+                          React.createElement('span', { style: { fontSize: 11, color: C.sub } }, '3—16，建议 8'),
+                        ),
+                        React.createElement('div', { style: { fontSize: 11.5, color: C.sub, margin: '10px 0 4px' } }, '额外要求（可选）'),
+                        React.createElement('textarea', {
+                          value: wiz.extra,
+                          onChange: (e) => wizPatch({ extra: e.target.value }),
+                          rows: 3,
+                          placeholder: '例如：这一章要压住节奏，不要出现第二个角色；结尾要留钩子',
+                          style: { ...areaStyle, fontSize: 12 },
+                        }),
+                        React.createElement(
+                          'button',
+                          { onClick: () => void wizDirections(), disabled: wiz.running === true, style: { ...btn('primary'), marginTop: 14 } },
+                          wiz.running === true ? '模型思考中…' : '✨ 让模型给方向',
+                        ),
+                      )
+                    : null,
+                  // 第二步：方向清单
+                  wiz.step === 2
+                    ? React.createElement(
+                        'div',
+                        null,
+                        wiz.packInfo === undefined || wiz.packInfo === null
+                          ? null
+                          : React.createElement(
+                              'div',
+                              { style: { border: '1px solid ' + C.border, borderRadius: 8, padding: '8px 10px', marginBottom: 10, background: C.rail } },
+                              React.createElement(
+                                'div',
+                                { style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 5 } },
+                                React.createElement('span', { style: { fontSize: 11.5, fontWeight: 600 } }, '📦 这次给模型读了什么'),
+                                React.createElement(Chip, null, String(wiz.packInfo.packChars) + ' 字'),
+                              ),
+                              React.createElement(
+                                'div',
+                                { style: { fontSize: 10.5, color: C.sub, lineHeight: 1.9 } },
+                                '· 大纲：本章前后各 ' + String(wiz.packInfo.outline.window) + ' 章（' + String(wiz.packInfo.outline.near) + ' 个）' +
+                                  (wiz.packInfo.outline.related > 0 ? ' + 相关人物回查 ' + String(wiz.packInfo.outline.related) + ' 个' : '') +
+                                  '，全书共 ' + String(wiz.packInfo.outline.total) + ' 个节点',
+                                React.createElement('br'),
+                                '· 剧情总结：近 ' + String(wiz.packInfo.summaries.recent) + ' 章给了全文' +
+                                  (wiz.packInfo.summaries.upgraded > 0 ? ' + ' + String(wiz.packInfo.summaries.upgraded) + ' 章因配角回查升级（第' + wiz.packInfo.summaries.upgradedChapters.join('、') + '章）' : '') +
+                                  '，更早的 ' + String(wiz.packInfo.summaries.digested) + ' 章只给一句话',
+                                React.createElement('br'),
+                                '· 上一章正文：' + String(wiz.packInfo.previous.used) + ' / ' + String(wiz.packInfo.previous.original) + ' 字（只取结尾接话）',
+                                React.createElement('br'),
+                                '· 人物卡：读了 ' + String(wiz.packInfo.people.usedCount) + ' / ' + String(wiz.packInfo.people.total) + ' 张' +
+                                  (wiz.packInfo.people.skippedCount > 0 ? '，跳过 ' + String(wiz.packInfo.people.skippedCount) + ' 张' : ''),
+                                wiz.packInfo.people.used.length === 0
+                                  ? null
+                                  : React.createElement('span', { style: { color: C.ok } }, '：' + wiz.packInfo.people.used.join('、')),
+                              ),
+                            ),
+                        React.createElement('div', { style: { fontSize: 11.5, color: C.sub, marginBottom: 8 } }, '勾掉不想写的；名字和说明都能改。'),
+                        ...wiz.directions.map((d, i) =>
+                          React.createElement(
+                            'div',
+                            { key: 'd' + String(i), style: { display: 'flex', gap: 8, alignItems: 'flex-start', padding: '6px 8px', border: '1px solid ' + C.border, borderRadius: 8, marginBottom: 6 } },
+                            React.createElement('input', {
+                              type: 'checkbox',
+                              checked: wiz.picked[d.index] === true,
+                              onChange: (e) => wizPatch({ picked: { ...wiz.picked, [d.index]: e.target.checked } }),
+                              style: { marginTop: 4 },
+                            }),
+                            React.createElement(
+                              'div',
+                              { style: { flex: 1, minWidth: 0 } },
+                              React.createElement('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+                                React.createElement(Chip, { tone: C.accent }, String.fromCharCode(65 + (d.index % 26))),
+                                React.createElement('span', { style: { fontSize: 12, fontWeight: 600 } }, d.name),
+                              ),
+                              React.createElement('div', { style: { fontSize: 11.5, color: C.sub, marginTop: 3, lineHeight: 1.7 } }, d.detail),
+                            ),
+                          ),
+                        ),
+                        React.createElement(
+                          'div',
+                          { style: { display: 'flex', gap: 8, marginTop: 12 } },
+                          React.createElement(
+                            'button',
+                            { onClick: () => void wizWrite(), disabled: wiz.running === true, style: btn('primary') },
+                            '✍️ 开始写候选（' + String(wiz.directions.filter((x) => wiz.picked[x.index] === true).length) + ' 篇）',
+                          ),
+                          React.createElement('button', { onClick: () => wizPatch({ step: 1 }), disabled: wiz.running === true, style: btn() }, '← 上一步'),
+                        ),
+                      )
+                    : null,
+                  // 第三步：进度
+                  wiz.step === 3
+                    ? React.createElement(
+                        'div',
+                        null,
+                        React.createElement('div', { style: { fontSize: 12.5, fontWeight: 600, marginBottom: 6 } },
+                          '正在写 ' + String(wiz.progress.done + 1) + '/' + String(wiz.progress.total) + '：' + String(wiz.progress.current)),
+                        React.createElement('div', { style: { height: 6, background: C.border, borderRadius: 99, overflow: 'hidden', marginBottom: 10 } },
+                          React.createElement('div', {
+                            style: {
+                              height: '100%',
+                              width: Math.round((wiz.progress.done / Math.max(wiz.progress.total, 1)) * 100) + '%',
+                              background: C.accent,
+                              transition: 'width 0.3s',
+                            },
+                          }),
+                        ),
+                        React.createElement('div', { style: { fontSize: 11.5, color: C.sub, lineHeight: 1.8 } }, '一次写一篇，写完就落盘。中途可以停，已经写好的不会丢。'),
+                        React.createElement('button', { onClick: () => { abortRef.current = true }, disabled: wiz.running !== true, style: { ...btn('danger'), marginTop: 10 } }, '停一下'),
+                      )
+                    : null,
+                  // 第四步：完成
+                  wiz.step === 4
+                    ? React.createElement(
+                        'div',
+                        null,
+                        React.createElement('div', { style: { fontSize: 13, fontWeight: 600, marginBottom: 8 } }, '写好了 ' + String(wiz.progress.done) + ' 篇候选稿'),
+                        React.createElement('div', { style: { fontSize: 11.5, color: C.sub, lineHeight: 1.9 } }, '关掉这个窗口，在左边点开看，逐段标 👍 / 👎，然后「合稿定稿」写进正文。'),
+                        React.createElement('button', { onClick: () => closeWizard(), style: { ...btn('primary'), marginTop: 12 } }, '好，去看候选稿'),
+                      )
+                    : null,
+                  ),
+                  // 中间的分隔条：拖动左右两栏的宽度
+                  wiz.briefOpen === false
+                    ? null
+                    : React.createElement('div', {
+                        key: 'divider',
+                        title: '拖动调整左右宽度',
+                        onMouseDown: (e) => {
+                          e.preventDefault()
+                          const startX = e.clientX
+                          const startW = Number(wiz.briefWidth) > 0 ? Number(wiz.briefWidth) : 460
+                          const move = (ev) => {
+                            wizPatch({ briefWidth: Math.max(320, Math.min(900, startW + (startX - ev.clientX))) })
+                          }
+                          const up = () => {
+                            window.removeEventListener('mousemove', move)
+                            window.removeEventListener('mouseup', up)
+                            document.body.style.cursor = ''
+                            document.body.style.userSelect = ''
+                          }
+                          document.body.style.cursor = 'col-resize'
+                          document.body.style.userSelect = 'none'
+                          window.addEventListener('mousemove', move)
+                          window.addEventListener('mouseup', up)
+                        },
+                        style: {
+                          flex: '0 0 6px',
+                          alignSelf: 'stretch',
+                          cursor: 'col-resize',
+                          background: C.border,
+                          opacity: 0.7,
+                        },
+                      }),
+                  // 右：开章体检（默认展开）
+                  wiz.briefOpen === false
+                    ? null
+                    : React.createElement(ChapterBrief, {
+                        key: 'brief',
+                        chapter: wiz.chapter,
+                        setupText: wiz.setupText,
+                        refreshKey: wiz.briefRefresh,
+                        onReload: () => wizPatch({ briefRefresh: (wiz.briefRefresh || 0) + 1 }),
+                        onFill: (text) => fillExtra(text),
+                        toast,
+                        width: wiz.briefWidth,
+                        onResize: (w) => wizPatch({ briefWidth: w }),
+                        onCollapse: () => wizPatch({ briefOpen: false }),
+                      }),
+                ),
+                // 提示条
+                wiz.notice === ''
+                  ? null
+                  : React.createElement('div', { style: { padding: '7px 14px', fontSize: 11.5, color: C.sub, borderTop: '1px solid ' + C.border, flexShrink: 0 } }, wiz.notice),
+              ),
+            ),
+      )
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // 张力折线：比原来一排横条更容易一眼看出走势
+    // ══════════════════════════════════════════════════════════
+    /**
+     * 只画最近 12 章，5 分制。4 分处有虚线参考线（过 4 才算「爆」）；
+     * 峰值那一点单独标出来，作者最需要看到「全书最高才几分」。
+     */
+    function TensionChart({ points, peak }) {
+      const list = (Array.isArray(points) ? points : []).slice(-12)
+      if (list.length === 0) return null
+      const W = 360
+      const H = 96
+      const padL = 22
+      const padR = 8
+      const padT = 10
+      const padB = 18
+      const innerW = W - padL - padR
+      const innerH = H - padT - padB
+      const stepX = list.length === 1 ? 0 : innerW / (list.length - 1)
+      const yOf = (v) => padT + innerH - (Math.max(0, Math.min(5, v)) / 5) * innerH
+      const xOf = (i) => padL + i * stepX
+      const coords = list.map((p, i) => [xOf(i), yOf(p.value)])
+      const poly = coords.map((c) => c[0].toFixed(1) + ',' + c[1].toFixed(1)).join(' ')
+      const area = padL.toFixed(1) + ',' + (padT + innerH).toFixed(1) + ' ' + poly + ' ' + (padL + innerW).toFixed(1) + ',' + (padT + innerH).toFixed(1)
+      const y4 = yOf(4)
+      const peakIdx = list.findIndex((p) => p.chapter === peak)
+      const children = [
+        // 4 分参考线
+        React.createElement('line', {
+          key: 'ref4',
+          x1: padL,
+          y1: y4,
+          x2: padL + innerW,
+          y2: y4,
+          stroke: C.danger,
+          strokeWidth: 1,
+          strokeDasharray: '3 3',
+          opacity: 0.45,
+        }),
+        React.createElement('text', { key: 'ref4t', x: 2, y: y4 + 3.5, fontSize: 9, fill: C.danger, opacity: 0.8 }, '4'),
+        // 底线
+        React.createElement('line', {
+          key: 'base',
+          x1: padL,
+          y1: padT + innerH,
+          x2: padL + innerW,
+          y2: padT + innerH,
+          stroke: C.border,
+          strokeWidth: 1,
+        }),
+        // 折线 + 填充
+        React.createElement('polyline', { key: 'area', points: area, fill: C.accent, opacity: 0.1, stroke: 'none' }),
+        React.createElement('polyline', { key: 'line', points: poly, fill: 'none', stroke: C.accent, strokeWidth: 1.8, strokeLinejoin: 'round' }),
+      ]
+      coords.forEach((c, i) => {
+        const p = list[i]
+        children.push(
+          React.createElement('circle', {
+            key: 'pt' + String(p.chapter),
+            cx: c[0],
+            cy: c[1],
+            r: i === peakIdx ? 3.6 : 2.4,
+            fill: i === peakIdx ? C.danger : C.accent,
+            opacity: p.source === 'manual' ? 1 : 0.75,
+          }),
+        )
+      })
+      // 峰值标注
+      if (peakIdx >= 0) {
+        const c = coords[peakIdx]
+        children.push(
+          React.createElement(
+            'text',
+            {
+              key: 'peaklbl',
+              x: Math.min(W - 24, Math.max(4, c[0] - 8)),
+              y: Math.max(9, c[1] - 6),
+              fontSize: 9.5,
+              fill: C.danger,
+              fontWeight: 700,
+            },
+            '峰 ' + String(list[peakIdx].value),
+          ),
+        )
+      }
+      // 首尾章号
+      children.push(
+        React.createElement('text', { key: 'labA', x: padL - 2, y: H - 4, fontSize: 9, fill: C.sub }, String(list[0].chapter)),
+        React.createElement('text', { key: 'labB', x: padL + innerW - 8, y: H - 4, fontSize: 9, fill: C.sub }, String(list[list.length - 1].chapter)),
+      )
+      return React.createElement(
+        'svg',
+        { viewBox: '0 0 ' + String(W) + ' ' + String(H), width: '100%', height: H, style: { display: 'block', overflow: 'visible' } },
+        ...children,
+      )
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // 开章体检：开新章弹窗右侧那一栏
+    // ══════════════════════════════════════════════════════════
+    /**
+     * 四块：张力曲线 / 结构问题 / 下一章往哪写 / 这一章要注意。
+     * 前三块纯本地统计（newchapter.brief），随章号自动重载、不花钱；
+     * 只有「让模型给 3 条走向」要花钱，必须作者自己点。
+     */
+    function ChapterBrief({ chapter, setupText, refreshKey, onReload, onFill, toast, width, onResize, onCollapse }) {
+      const [data, setData] = useState(null)
+      const [loading, setLoading] = useState(true)
+      const [err, setErr] = useState('')
+      const [moves, setMoves] = useState(null)
+      const [movesBusy, setMovesBusy] = useState(false)
+      const [filled, setFilled] = useState({})
+      const setupRef = useRef(setupText === undefined ? '' : setupText)
+      setupRef.current = setupText === undefined ? '' : setupText
+
+      const load = useCallback(async () => {
+        setLoading(true)
+        try {
+          const d = await rpc('newchapter.brief', { chapter, setupText: setupRef.current })
+          setData(d)
+          setErr('')
+        } catch (e) {
+          setData(null)
+          setErr(String(e.message || e))
+        } finally {
+          setLoading(false)
+        }
+      }, [chapter])
+
+      // 换章号才重读；本章设定在打字时不重读（改完点「↻」）
+      useEffect(() => {
+        setMoves(null)
+        setFilled({})
+        void load()
+      }, [load, refreshKey])
+
+      const askMoves = async () => {
+        setMovesBusy(true)
+        try {
+          const r = await rpc('newchapter.nextMoves', { chapter, setupText: setupRef.current })
+          setMoves(r)
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setMovesBusy(false)
+        }
+      }
+
+      const take = (m) => {
+        onFill(m.name + '：' + m.detail)
+        setFilled((cur) => ({ ...cur, [m.letter]: true }))
+      }
+
+      const blockStyle = { border: '1px solid ' + C.border, borderRadius: 10, padding: '9px 10px', marginBottom: 9, background: C.card }
+      const titleOf = (text, extra) =>
+        React.createElement(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6, flexWrap: 'wrap' } },
+          React.createElement('span', { style: { fontSize: 12, fontWeight: 700 } }, text),
+          ...(extra === undefined || extra === null ? [] : [extra]),
+        )
+
+      const briefW = Number(width) > 0 ? Number(width) : 460
+      return React.createElement(
+        'div',
+        {
+          style: {
+            flex: '0 0 ' + String(briefW) + 'px',
+            width: String(briefW) + 'px',
+            minWidth: 0,
+            minHeight: 0,
+            alignSelf: 'stretch',
+            overflowY: 'auto',
+            overscrollBehavior: 'contain',
+            padding: '12px 14px 20px',
+            borderLeft: '1px solid ' + C.border,
+            background: C.rail,
+            boxSizing: 'border-box',
+            position: 'relative',
+          },
+        },
+
+        React.createElement(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 } },
+          React.createElement('span', { style: { fontSize: 14, fontWeight: 800 } }, '📊 开章体检'),
+          React.createElement(Chip, null, '第' + String(chapter) + '章'),
+          React.createElement('div', { style: { flex: 1 } }),
+          React.createElement('button', { onClick: () => void onReload(), style: { ...btn(), padding: '1px 8px', fontSize: 11 } }, '↻ 重算'),
+          onCollapse === undefined
+            ? null
+            : React.createElement('button', { onClick: () => onCollapse(), title: '收起右侧栏，窗口变窄', style: { ...btn(), padding: '1px 7px', fontSize: 11 } }, '×'),
+        ),
+        loading && data === null
+          ? React.createElement('div', { style: { fontSize: 11.5, color: C.sub, padding: '10px 0' } }, '正在读全书算节奏…')
+          : err !== ''
+            ? React.createElement('div', { style: { fontSize: 11.5, color: C.danger, lineHeight: 1.8 } }, err)
+            : data === null
+              ? React.createElement('div', { style: { fontSize: 11.5, color: C.sub } }, '没有数据')
+              : React.createElement(
+                  'div',
+                  null,
+                  // ① 张力曲线
+                  React.createElement(
+                    'div',
+                    { style: blockStyle },
+                    titleOf('📈 张力曲线', React.createElement(Chip, null, String(data.tension.points.length) + ' 章')),
+                    data.tension.points.length === 0
+                      ? React.createElement('div', { style: { fontSize: 11.5, color: C.sub } }, '前面还没有写完的章，没有曲线。')
+                      : React.createElement(
+                          'div',
+                          null,
+                          React.createElement(TensionChart, { points: data.tension.points, peak: data.tension.peak }),
+                          React.createElement('div', { style: { fontSize: 11.5, color: C.sub, lineHeight: 1.85, marginTop: 7 } }, data.tension.line),
+                        ),
+                      ),
+
+                  // ② 结构问题
+                  React.createElement(
+                    'div',
+                    { style: blockStyle },
+                    titleOf('🔍 结构问题', React.createElement(Chip, null, String(data.issues.length) + ' 条')),
+                    ...data.issues.map((x, i) =>
+                      React.createElement(
+                        'div',
+                        {
+                          key: 'is' + String(i),
+                          style: {
+                            fontSize: 11.5,
+                            lineHeight: 1.8,
+                            color: x.level === 'warn' ? C.text : C.sub,
+                            padding: '4px 7px',
+                            marginBottom: 4,
+                            borderRadius: 7,
+                            background: x.level === 'warn' ? 'rgba(255,159,10,0.07)' : 'transparent',
+                            border: '1px solid ' + (x.level === 'warn' ? C.warn + '55' : C.border),
+                          },
+                        },
+                        (x.level === 'warn' ? '⚠ ' : x.level === 'ok' ? '✓ ' : 'ℹ ') + x.text,
+                      ),
+                    ),
+                  ),
+                  // ③ 下一章往哪写
+                  React.createElement(
+                    'div',
+                    { style: blockStyle },
+                    titleOf('🧭 下一章往哪写'),
+                    data.pacing.length === 0
+                      ? React.createElement('div', { style: { fontSize: 11, color: C.sub } }, '节奏上暂时没有特别要提醒的。')
+                      : React.createElement(
+                          'div',
+                          null,
+                          React.createElement('div', { style: { fontSize: 10.5, color: C.sub, marginBottom: 3 } }, '写作包里已经这么跟模型说了：'),
+                          ...data.pacing.map((t, i) =>
+                            React.createElement('div', { key: 'pc' + String(i), style: { fontSize: 11.5, lineHeight: 1.8, marginBottom: 3 } }, '· ' + t),
+                          ),
+                        ),
+                    React.createElement(
+                      'div',
+                      { style: { display: 'flex', gap: 6, marginTop: 8, alignItems: 'center', flexWrap: 'wrap' } },
+                      React.createElement(
+                        'button',
+                        { onClick: () => void askMoves(), disabled: movesBusy, style: { ...btn('primary'), padding: '3px 10px', fontSize: 11.5 } },
+                        movesBusy ? '模型在想…' : '🤖 让模型给 3 条走向',
+                      ),
+                      moves === null
+                        ? React.createElement('span', { style: { fontSize: 10.5, color: C.sub } }, '调用模型，会花一点额度')
+                        : React.createElement(Chip, { tone: C.ok }, '来自 ' + String(moves.model)),
+                    moves === null || moves.source === undefined || moves.source === null
+                      ? null
+                      : React.createElement(
+                          'div',
+                          { style: { fontSize: 10.5, color: moves.source.pack === true ? C.ok : C.warn, marginTop: 4, lineHeight: 1.6 } },
+                          (moves.source.pack === true ? '📚 ' : '⚠ ') + String(moves.source.note),
+                        ),
+                    ),
+                    moves === null
+                      ? null
+                      : React.createElement(
+                          'div',
+                          { style: { marginTop: 8 } },
+                          ...moves.moves.map((m) =>
+                            React.createElement(
+                              'div',
+                              { key: 'mv' + m.letter, style: { border: '1px solid ' + C.border, borderRadius: 8, padding: '6px 8px', marginBottom: 6 } },
+                              React.createElement(
+                                'div',
+                                { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 } },
+                                React.createElement(Chip, { tone: C.accent }, m.letter),
+                                React.createElement('span', { style: { fontSize: 11.5, fontWeight: 600 } }, m.name),
+                                React.createElement('div', { style: { flex: 1 } }),
+                                React.createElement(
+                                  'button',
+                                  {
+                                    onClick: () => take(m),
+                                    title: '把这一条写进左边的「额外要求」',
+                                    style: { ...btn(filled[m.letter] === true ? undefined : 'primary'), padding: '1px 8px', fontSize: 11 },
+                                  },
+                                  filled[m.letter] === true ? '✓ 已填' : '↩ 填进额外要求',
+                                ),
+                              ),
+                              React.createElement('div', { style: { fontSize: 11.5, color: C.sub, lineHeight: 1.8 } }, m.detail),
+                            ),
+                          ),
+                          React.createElement(
+                            'button',
+                            { onClick: () => setMoves(null), style: { ...btn(), padding: '1px 8px', fontSize: 10.5 } },
+                            '✕ 都不要',
+                          ),
+                        ),
+                  ),
+                  // ④ 这一章要注意
+                  React.createElement(
+                    'div',
+                    { style: blockStyle },
+                    titleOf('📌 这一章要注意'),
+                    ...data.checklist.map((c, i) =>
+                      React.createElement(
+                        'div',
+                        { key: 'ck' + String(i), style: { display: 'flex', gap: 5, fontSize: 11.5, lineHeight: 1.8, color: c.ok ? C.sub : C.text, marginBottom: 2 } },
+                        React.createElement('span', { style: { color: c.ok ? C.ok : C.warn, flexShrink: 0 } }, c.ok ? '✓' : '⚠'),
+                        React.createElement('span', null, c.text),
+                      ),
+                    ),
+                  ),
+                  // ⑤ 欠账清单（和本章有关的排在前面）
+                  data.debts.length === 0
+                    ? null
+                    : React.createElement(
+                        'div',
+                        { style: blockStyle },
+                        titleOf('🧵 还没收的欠账', React.createElement(Chip, null, String(data.debts.length) + ' 条')),
+                        ...data.debts.map((d, i) =>
+                          React.createElement(
+                            'div',
+                            { key: 'db' + String(i), style: { fontSize: 11.5, lineHeight: 1.8, color: d.related ? C.text : C.sub, marginBottom: 2 } },
+                            (d.related ? '· ' : '· ') + '「' + d.name + '」' + (d.plantedChapter === null ? '' : ' 第' + String(d.plantedChapter) + '章埋') + (d.overdue ? ' · 超期' : ''),
+                          ),
+                        ),
+                        React.createElement('div', { style: { fontSize: 10.5, color: C.sub, marginTop: 4 } }, '深色的和这一章人物有关。逐条看请去「情节」页。'),
+                      ),
+                ),
+      )
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // 回收站页
+    // ══════════════════════════════════════════════════════════
+    function TrashPage({ toast }) {
+      const [texts, setTexts] = useState([])
+      const [drafts, setDrafts] = useState([])
+      const [files, setFiles] = useState([])
+      const [loading, setLoading] = useState(true)
+      const [preview, setPreview] = useState(null)
+      const [busy, setBusy] = useState(false)
+
+      const load = useCallback(async () => {
+        setLoading(true)
+        try {
+          const d = await rpc('trash.list')
+          setTexts(d.texts || [])
+          setDrafts(d.drafts || [])
+          setFiles(d.files || [])
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setLoading(false)
+        }
+      }, [toast])
+
+      useEffect(() => {
+        void load()
+      }, [load])
+
+      const view = async (item) => {
+        try {
+          if (item.kind === 'file') {
+            const d = await rpc('file.read', { path: item.path })
+            setPreview({ key: 'file|' + item.name, title: item.title, text: d.text, chars: d.chars })
+            return
+          }
+          const d = await rpc('trash.read', { name: item.name, kind: item.kind })
+          setPreview({ key: item.kind + '|' + item.name, title: item.title, text: d.text, chars: d.chars })
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+      const restore = async (item) => {
+        if (item.kind === 'file') {
+          if (!window.confirm('把「' + String(item.title) + '」放回 ' + String(item.rel) + '？')) return
+          setBusy(true)
+          try {
+            const d = await rpc('trash.restoreFile', { name: item.name })
+            toast('已放回：' + String(d.rel))
+            setPreview(null)
+            await load()
+          } catch (e) {
+            toast(String(e.message || e))
+          } finally {
+            setBusy(false)
+          }
+          return
+        }
+        if (!window.confirm('恢复「' + item.title + '」？')) return
+        setBusy(true)
+        try {
+          const d = await rpc('trash.restore', { name: item.name, kind: item.kind })
+          toast('已恢复到：' + String(d.path))
+          setPreview(null)
+          await load()
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const purge = async (item) => {
+        if (!window.confirm('彻底删除「' + item.title + '」？\n\n不可恢复。')) return
+        setBusy(true)
+        try {
+          if (item.kind === 'file') await rpc('trash.purgeFile', { name: item.name })
+          else await rpc('trash.purge', { name: item.name, kind: item.kind })
+          toast('已彻底删除')
+          if (preview !== null && preview.key === item.kind + '|' + item.name) setPreview(null)
+          await load()
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const purgeAll = async () => {
+        const n = texts.length + drafts.length + files.length
+        if (n === 0) return
+        if (!window.confirm('清空回收站？\n\n会彻底删除 ' + String(n) + ' 项，不可恢复。')) return
+        setBusy(true)
+        try {
+          const d = await rpc('trash.purgeAll')
+          toast('已清空 ' + String(d.removedCount) + ' 项')
+          setPreview(null)
+          await load()
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const column = (title, icon, list, kind) =>
+        React.createElement(
+          'div',
+          { style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', borderRight: '1px solid ' + C.border } },
+          React.createElement('div', { style: { padding: '7px 11px', fontSize: 11, fontWeight: 600, color: C.sub, background: C.rail, borderBottom: '1px solid ' + C.border, flexShrink: 0 } }, icon + ' ' + title + '（' + String(list.length) + '）'),
+          React.createElement(
+            'div',
+            {
+              style: {
+                flex: '1 1 0',
+                minHeight: 0,
+                overflowY: 'auto',
+                overflowX: 'hidden',
+                overscrollBehavior: 'contain',
+                paddingBottom: 4,
+              },
+            },
+            list.length === 0
+              ? React.createElement('div', { style: { padding: 12, color: C.sub, fontSize: 11.5 } }, '空')
+              : list.map((item) =>
+                  React.createElement(
+                    'div',
+                    { key: item.name, style: { padding: '7px 11px', borderBottom: '1px solid ' + C.border, background: preview !== null && preview.key === kind + '|' + item.name ? 'rgba(10,132,255,0.08)' : 'transparent' } },
+                    React.createElement('div', { style: { fontSize: 12, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, item.kind === 'file' ? String(item.title) : (item.chapter === null ? '' : '第' + String(item.chapter) + '章 ') + String(item.title)),
+                    React.createElement(
+                      'div',
+                      { style: { fontSize: 10.5, color: C.sub, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+                      fmtTime(item.mtime) + '　' + (item.kind === 'file' ? String(item.rel) : fmtBytes(item.bytes)),
+                    ),
+                    React.createElement(
+                      'div',
+                      { style: { display: 'flex', gap: 5, marginTop: 5 } },
+                      React.createElement('button', { onClick: () => void view(item), disabled: busy, style: { ...btn(), padding: '1px 7px', fontSize: 10.5 } }, '查看'),
+                      React.createElement('button', { onClick: () => void restore(item), disabled: busy, style: { ...btn(), padding: '1px 7px', fontSize: 10.5, color: C.accent, borderColor: C.accent + '55' } }, '恢复'),
+                      React.createElement('button', { onClick: () => void purge(item), disabled: busy, style: { ...btn('danger'), padding: '1px 7px', fontSize: 10.5 } }, '✕ 彻底删'),
+                    ),
+                  ),
+                ),
+          ),
+        )
+
+      return React.createElement(
+        'div',
+        { style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, ...cardStyle, overflow: 'hidden' } },
+        loading
+          ? React.createElement(Empty, null, '读取中…')
+          : React.createElement(
+              React.Fragment,
+              null,
+              React.createElement(
+                'div',
+                { style: { flex: 1, minHeight: 0, display: 'flex' } },
+                column('设定文件', '📁', files, 'file'),
+                column('正文', '📄', texts, 'text'),
+                React.createElement(
+                  'div',
+                  { style: { width: '38%', minWidth: 0, display: 'flex', flexDirection: 'column' } },
+                  React.createElement('div', { style: { padding: '7px 11px', fontSize: 11, fontWeight: 600, color: C.sub, background: C.rail, borderBottom: '1px solid ' + C.border, flexShrink: 0 } }, preview === null ? '👁 预览' : '👁 ' + String(preview.title) + '（' + String(preview.chars) + ' 字）'),
+                  React.createElement(
+                    'div',
+                    { style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '10px 12px', fontSize: 12.5, lineHeight: 1.9, whiteSpace: 'pre-wrap' } },
+                    preview === null ? React.createElement('span', { style: { color: C.sub, fontSize: 11.5 } }, '点左边「查看」看原文') : preview.text,
+                  ),
+                ),
+              ),
+              React.createElement(
+                'div',
+                { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderTop: '1px solid ' + C.border, flexShrink: 0 } },
+                React.createElement('span', { style: { fontSize: 11.5, color: C.sub } }, '共 ' + String(texts.length + files.length) + ' 项（设定文件 ' + String(files.length) + ' · 正文 ' + String(texts.length) + '）'),
+                React.createElement('div', { style: { flex: 1 } }),
+                React.createElement(
+                  'button',
+                  {
+                    onClick: () => {
+                      void (async () => {
+                        await load()
+                        toast('回收站已重新读取：' + String(texts.length + files.length) + ' 项')
+                      })()
+                    },
+                    disabled: busy,
+                    style: { ...btn(), padding: '2px 9px', fontSize: 11 },
+                    title: '重新读取回收站',
+                  },
+                  '↻ 刷新',
+                ),
+                React.createElement('button', { onClick: () => void purgeAll(), disabled: busy || texts.length + drafts.length === 0, style: btn('solidDanger') }, '🗑 清空回收站'),
+              ),
+            ),
+      )
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // 偏好档案页
+    // ══════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════
+    // 作品分析弹窗：左边选书/分析，右边看模型输出的风格结论
+    // ══════════════════════════════════════════════════════════
+    /**
+     * 独立弹窗，不挤在偏好档案页里。
+     *
+     * 设计沿用「左右分区 + 各自滚动」那一套（和开新章弹窗同一个坑，别再踩）：
+     * - 卡片给确定高度，否则两栏的 overflow 没有可滚空间；
+     * - 主体 overflow: hidden，左右各自 overflowY: auto；
+     * - 中间 6px 分隔条可拖，右栏 340—800。
+     */
+    /**
+     * 融合结果的「写进档案」区。
+     *
+     * 之前只有一个按钮：一点就把全部结论塞进档案，作者没法挑——
+     * 明明只要那三条，也得连不想要的十条一起收下。现在每条一个勾，
+     * 默认全勾，不想要的自己取消，按钮只会写勾上的那些。
+     */
+    function CrossApply({ result, onApply, toast }) {
+      const prefer = Array.isArray(result.prefer) ? result.prefer : []
+      const avoid = Array.isArray(result.avoid) ? result.avoid : []
+      const [off, setOff] = useState({})
+      const keyOf = (kind, i) => kind + '-' + String(i)
+      const isOn = (kind, i) => off[keyOf(kind, i)] !== true
+      const toggle = (kind, i) => setOff((cur) => ({ ...cur, [keyOf(kind, i)]: cur[keyOf(kind, i)] !== true }))
+      const pickedPrefer = prefer.filter((_, i) => isOn('p', i))
+      const pickedAvoid = avoid.filter((_, i) => isOn('a', i))
+      const total = pickedPrefer.length + pickedAvoid.length
+      const row = (kind, i, text) =>
+        React.createElement(
+          'label',
+          {
+            key: keyOf(kind, i),
+            style: { display: 'flex', alignItems: 'flex-start', gap: 6, padding: '2px 0', cursor: 'pointer', lineHeight: 1.65 },
+          },
+          React.createElement('input', {
+            type: 'checkbox',
+            checked: isOn(kind, i),
+            onChange: () => toggle(kind, i),
+            style: { marginTop: 3, flexShrink: 0 },
+          }),
+          React.createElement('span', { style: { fontSize: 11, color: C.text } }, String(text)),
+        )
+
+      return React.createElement(
+        'div',
+        { style: { marginBottom: 8, border: '1px solid ' + C.border, borderRadius: 8, padding: '8px 10px', background: C.rail } },
+        React.createElement(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 5 } },
+          React.createElement('span', { style: { fontSize: 11.5, fontWeight: 700 } }, '要写进档案的（自己勾）'),
+          React.createElement('div', { style: { flex: 1 } }),
+          React.createElement(
+            'button',
+            {
+              onClick: () => {
+                const allOn = total === prefer.length + avoid.length && total > 0
+                const next = {}
+                if (allOn) {
+                  prefer.forEach((_, i) => {
+                    next['p-' + String(i)] = true
+                  })
+                  avoid.forEach((_, i) => {
+                    next['a-' + String(i)] = true
+                  })
+                }
+                setOff(next)
+              },
+              style: { ...btn(), padding: '1px 7px', fontSize: 10 },
+            },
+            total === prefer.length + avoid.length && total > 0 ? '全不选' : '全选',
+          ),
+        ),
+        prefer.length === 0
+          ? null
+          : React.createElement(
+              'div',
+              { style: { marginBottom: 4 } },
+              React.createElement('div', { style: { fontSize: 10.5, color: C.ok, fontWeight: 700, margin: '2px 0' } }, '照着写（' + String(prefer.length) + ' 条）'),
+              ...prefer.map((x, i) => row('p', i, x)),
+            ),
+        avoid.length === 0
+          ? null
+          : React.createElement(
+              'div',
+              null,
+              React.createElement('div', { style: { fontSize: 10.5, color: C.sub, fontWeight: 700, margin: '2px 0' } }, '别这么写（' + String(avoid.length) + ' 条）'),
+              ...avoid.map((x, i) => row('a', i, x)),
+            ),
+        React.createElement(
+          'button',
+          {
+            onClick: () => {
+              const lines = []
+              if (pickedPrefer.length > 0) lines.push('### 跨书融合：照着写', ...pickedPrefer.map((x) => '- ' + x))
+              if (pickedAvoid.length > 0) lines.push('', '### 跨书融合：别这么写', ...pickedAvoid.map((x) => '- ' + x))
+              if (lines.length === 0) {
+                if (typeof toast === 'function') toast('一条都没勾')
+                return
+              }
+              onApply(lines.join('\n'))
+            },
+            disabled: total === 0,
+            style: { ...btn('primary'), marginTop: 6, padding: '4px 12px', fontSize: 11.5, fontWeight: 700, width: '100%' },
+          },
+          '＋ 把勾上的 ' + String(total) + ' 条写进偏好档案',
+        ),
+        React.createElement(
+          'div',
+          { style: { fontSize: 10.5, color: C.sub, lineHeight: 1.65, marginTop: 4 } },
+          '偏好档案就是写作包第 ② 节：写进去之后，开新章生成候选稿会照这些写法来。',
+        ),
+      )
+    }
+
+    function AnalysisModal({ toast, onClose, onResult, onApply, initial }) {
+      const [result, setResult] = useState(initial === undefined ? null : initial)
+      const [rightW, setRightW] = useState(460)
+      const [copied, setCopied] = useState(false)
+
+      const push = (r) => {
+        setResult(r)
+        if (typeof onResult === 'function') onResult(r)
+      }
+
+      const startResize = (e) => {
+        e.preventDefault()
+        const startX = e.clientX
+        const startW = rightW
+        const move = (ev) => setRightW(Math.max(340, Math.min(800, startW + (startX - ev.clientX))))
+        const up = () => {
+          window.removeEventListener('mousemove', move)
+          window.removeEventListener('mouseup', up)
+          document.body.style.cursor = ''
+          document.body.style.userSelect = ''
+        }
+        document.body.style.cursor = 'col-resize'
+        document.body.style.userSelect = 'none'
+        window.addEventListener('mousemove', move)
+        window.addEventListener('mouseup', up)
+      }
+
+      const text = result === null ? '' : String(result.text === undefined ? '' : result.text)
+
+      return React.createElement(
+        'div',
+        {
+          onClick: (e) => {
+            if (e.target === e.currentTarget) onClose()
+          },
+          style: {
+            position: 'fixed',
+            inset: 0,
+            zIndex: 4000,
+            background: 'rgba(0,0,0,0.42)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 16,
+            boxSizing: 'border-box',
+          },
+        },
+        React.createElement(
+          'div',
+          {
+            style: {
+              width: 'min(' + String(420 + rightW + 30) + 'px, 100%)',
+              height: 'min(820px, calc(100vh - 32px))',
+              maxHeight: '100%',
+              background: C.card,
+              border: '1px solid ' + C.border,
+              borderRadius: 12,
+              boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
+              display: 'flex',
+              flexDirection: 'column',
+              overflow: 'hidden',
+            },
+          },
+          // 标题栏
+          React.createElement(
+            'div',
+            { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderBottom: '1px solid ' + C.border, flexShrink: 0 } },
+            React.createElement('span', { style: { fontWeight: 700, fontSize: 13.5 } }, '📊 作品分析'),
+            React.createElement(Chip, null, '成品书库'),
+            React.createElement('div', { style: { flex: 1 } }),
+            text === ''
+              ? null
+              : React.createElement(
+                  'button',
+                  {
+                    onClick: () => {
+                      void navigator.clipboard.writeText(text).then(() => {
+                        setCopied(true)
+                        setTimeout(() => setCopied(false), 1500)
+                      })
+                    },
+                    style: { ...btn(), padding: '2px 9px', fontSize: 11.5 },
+                  },
+                  copied ? '✓ 已复制' : '复制结论',
+                ),
+            React.createElement('button', { onClick: () => onClose(), style: { ...btn(), padding: '2px 9px', fontSize: 11.5 } }, '关闭'),
+          ),
+          // 主体：左 / 分隔条 / 右
+          React.createElement(
+            'div',
+            { style: { flex: '1 1 0', minHeight: 0, display: 'flex', alignItems: 'stretch', overflow: 'hidden' } },
+            // 左：选书与分析
+            React.createElement(
+              'div',
+              {
+                style: {
+                  flex: '1 1 auto',
+                  minWidth: 400,
+                  minHeight: 0,
+                  alignSelf: 'stretch',
+                  overflowY: 'auto',
+                  overscrollBehavior: 'contain',
+                  padding: 12,
+                  boxSizing: 'border-box',
+                },
+              },
+              React.createElement(LearnLibrary, { toast, onApply, onResult: (r) => push(r) }),
+            ),
+            // 分隔条
+            React.createElement('div', {
+              onMouseDown: startResize,
+              title: '拖动调整左右宽度',
+              style: { flex: '0 0 6px', alignSelf: 'stretch', cursor: 'col-resize', background: C.border, opacity: 0.7 },
+            }),
+            // 右：模型输出的风格
+            React.createElement(
+              'div',
+              {
+                style: {
+                  flex: '0 0 ' + String(rightW) + 'px',
+                  width: String(rightW) + 'px',
+                  minWidth: 0,
+                  minHeight: 0,
+                  alignSelf: 'stretch',
+                  overflowY: 'auto',
+                  overscrollBehavior: 'contain',
+                  padding: '12px 14px 20px',
+                  borderLeft: '1px solid ' + C.border,
+                  background: C.rail,
+                  boxSizing: 'border-box',
+                },
+              },
+              React.createElement(
+                'div',
+                { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 } },
+                React.createElement('span', { style: { fontSize: 14, fontWeight: 800 } }, '🧬 模型给出的风格'),
+              ),
+              result === null
+                ? React.createElement(
+                    'div',
+                    { style: { fontSize: 11.5, color: C.sub, lineHeight: 1.9 } },
+                    '勾几本书点「▶ 全部做完」，或者点某本书的「打开」看它的写法，结论都会出现在这里。',
+                  )
+                : React.createElement(
+                    'div',
+                    null,
+                    React.createElement('div', { style: { fontSize: 12, fontWeight: 700, marginBottom: 8 } }, String(result.title === undefined ? '' : result.title)),
+                    result.kind === 'cross' ? React.createElement(CrossApply, { result, onApply, toast }) : null,
+                    React.createElement(
+                      'pre',
+                      { style: { margin: 0, fontSize: 11.5, lineHeight: 1.9, whiteSpace: 'pre-wrap', fontFamily: 'inherit', color: C.text } },
+                      text,
+                    ),
+                  ),
+            ),
+          ),
+        ),
+      )
+    }
+
+    /**
+     * 从成品小说学习。
+     *
+     * 四步：上传 → 粗扫挑重要块 → 精读 → 汇总。
+     * 每一步都能停，因为一本书可能要几十次模型调用。
+     */
+    function LearnLibrary({ toast, onApply, onResult }) {
+      const [tasks, setTasks] = useState([])
+      const [task, setTask] = useState(null)
+      const [busy, setBusy] = useState('')
+      const [progress, setProgress] = useState('')
+      const [err, setErr] = useState('')
+      // 书库：勾选哪些一起比、比哪几个维度、比出来的结果
+      const [picked, setPicked] = useState({})
+      const [dims, setDims] = useState({ style: true, speech: true, plot: true, tension: true, setting: true })
+      const [cross, setCross] = useState(null)
+      const [crossErr, setCrossErr] = useState('')
+      // 一键分析：把「粗扫 → 精读 → 汇总 → 融合」串成一个循环，前端每步调一次
+      const [runAll, setRunAll] = useState(null)
+      const runAllRef = useRef(false)
+      // 扫描判定默认收起：478 条铺在页面上太占地方，想看再点开
+      const [showVerdicts, setShowVerdicts] = useState(false)
+      // 一键分析跑完后的「粗扫结果」也默认收起：一本书几十行，会把下面的文件列表挤下去
+      const [showScans, setShowScans] = useState(false)
+      const DIM_LIST = [
+        { key: 'style', label: '写作风格' },
+        { key: 'speech', label: '人物说话' },
+        { key: 'plot', label: '剧情走向' },
+        { key: 'tension', label: '张力设计' },
+        { key: 'setting', label: '设定' },
+      ]
+      // 只数「当前列表里还在的书」：删掉的书在 picked 里留下的键不能算进去，
+      // 否则会出现「只选 1 本却显示 5 本」。
+      const taskIdSet = new Set(tasks.map((t) => t.taskId))
+      const pickedIds = Object.keys(picked).filter(
+        (k) => k.startsWith('__touched__') === false && picked[k] === true && taskIdSet.has(k),
+      )
+      const pickedDims = DIM_LIST.map((d) => d.key).filter((k) => dims[k] === true)
+      const togglePick = (id) =>
+        setPicked((cur) => ({ ...cur, [id]: cur[id] !== true, ['__touched__' + id]: true }))
+      const stopAll = () => {
+        runAllRef.current = false
+        setBusy('')
+        setRunAll((cur) => (cur === null ? cur : { ...cur, done: true, message: '已停（进度都存着，再点会接着做）' }))
+      }
+      const startRunAll = async (mode) => {
+        if (pickedIds.length === 0) {
+          setCrossErr('先勾选要处理的书')
+          return
+        }
+        setBusy('runall')
+        setCrossErr('')
+        // 新一轮要有新一轮的进度，别把上一本的结果带过来
+        setRunAll({ next: 'start', message: '开始…', progress: null, books: [] })
+        setShowScans(false)
+        runAllRef.current = true
+        let last = null
+        try {
+          for (let guard = 0; guard < 400; guard += 1) {
+            if (runAllRef.current !== true) return
+            last = await rpc('learn.runAll', { taskIds: pickedIds, mode, dims: pickedDims, cross: true })
+            setRunAll(last)
+            if (last.next !== 'book') break
+          }
+          await loadTasks()
+          // 把每本书的扫描判定抓回来给作者看：扫完之后挑中了哪些块、为什么
+          try {
+            const digs = []
+            for (const id of pickedIds) {
+              const g = await rpc('learn.get', { taskId: id })
+              const kept = (g.verdicts || []).filter((v) => v.keep === true)
+              digs.push({
+                taskId: id,
+                name: g.meta === undefined || g.meta === null ? id : g.meta.name,
+                scanned: (g.verdicts || []).length,
+                kept: kept.length,
+                picked: kept.slice(0, 12).map((v) => ({ i: v.i, title: v.title, why: v.why })),
+              })
+            }
+            setRunAll((cur) => ({ ...(cur === null ? {} : cur), scans: digs }))
+          } catch {
+            /* 拿不到就不显示，别把整个流程搞挂 */
+          }
+          if (last !== null && last.step === 'cross' && last.result !== undefined && last.result !== null) {
+            setCross(last.result)
+            if (typeof onResult === 'function') {
+              onResult({
+                kind: 'cross',
+                title: '融合结果 · 比了 ' + String(last.result.used.length) + ' 本',
+                text: last.result.text,
+                prefer: last.result.prefer,
+                avoid: last.result.avoid,
+                missing: last.result.missing,
+              })
+            }
+          }
+        } catch (e) {
+          setCrossErr(String(e.message || e))
+        } finally {
+          if (runAllRef.current === true) {
+            runAllRef.current = false
+            setBusy('')
+          }
+        }
+      }
+      const runCross = async () => {
+        if (pickedIds.length === 0) {
+          setCrossErr('先勾选要一起比的书')
+          return
+        }
+        setBusy('cross')
+        setCrossErr('')
+        try {
+          const r = await rpc('learn.crossAnalyze', { taskIds: pickedIds, dims: pickedDims })
+          setCross(r)
+          if (typeof onResult === 'function') onResult({ kind: 'cross', title: '融合结果 · 比了 ' + String(r.used.length) + ' 本', text: r.text, prefer: r.prefer, avoid: r.avoid, missing: r.missing })
+          const bits = ['比了 ' + String(r.used.length) + ' 本']
+          if (r.missing.length > 0) bits.push('跳过 ' + String(r.missing.length) + ' 本（没报告）')
+          toast(bits.join('，') + '：喂进去 ' + String(r.inputChars) + ' 字')
+        } catch (e) {
+          setCross(null)
+          setCrossErr(String(e.message || e))
+        } finally {
+          setBusy('')
+        }
+      }
+
+      const loadTasks = async () => {
+        try {
+          const d = await rpc('learn.list')
+          const list = d.tasks || []
+          setTasks(list)
+          // 新进来的书默认勾上；用户手动取消过的记住（touched 里存着），不会被自动勾回来
+          setPicked((cur) => {
+            const next = { ...cur }
+            for (const t of list) {
+              if (next['__touched__' + t.taskId] === true) continue
+              if (next[t.taskId] === undefined) next[t.taskId] = true
+            }
+            return next
+          })
+        } catch (e) {
+          setErr(String(e.message || e))
+        }
+      }
+
+      useEffect(() => {
+        void loadTasks()
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [])
+
+      const upload = async (file) => {
+        setBusy('upload')
+        setErr('')
+        try {
+          const buf = await file.arrayBuffer()
+          const bytes = new Uint8Array(buf)
+          // 一次把整本 base64 塞进一个请求，几 MB 的书就会撑爆请求体上限，
+          // 浏览器只报一句「Failed to fetch」。所以超过 1.5MB 就分片发。
+          const CHUNK_RAW = 1.5 * 1024 * 1024
+          const toB64 = (slice) => {
+            let bin = ''
+            const CH = 0x8000
+            for (let i = 0; i < slice.length; i += CH) {
+              bin += String.fromCharCode.apply(null, slice.subarray(i, i + CH))
+            }
+            return btoa(bin)
+          }
+          let r
+          if (bytes.length <= CHUNK_RAW) {
+            r = await rpc('learn.import', { name: file.name, data: toB64(bytes) })
+          } else {
+            const begin = await rpc('learn.uploadBegin', { name: file.name, size: bytes.length })
+            const total = Math.ceil(bytes.length / CHUNK_RAW)
+            for (let i = 0; i < total; i += 1) {
+              const slice = bytes.subarray(i * CHUNK_RAW, Math.min((i + 1) * CHUNK_RAW, bytes.length))
+              setProgress('上传 ' + String(i + 1) + '/' + String(total) + ' 片')
+              await rpc('learn.uploadChunk', { uploadId: begin.uploadId, data: toB64(slice) })
+            }
+            setProgress('解析中…')
+            r = await rpc('learn.uploadFinish', { uploadId: begin.uploadId })
+            setProgress('')
+          }
+          // 刚选的文件默认勾上，不想要自己取消
+          setPicked((cur) => ({ ...cur, [r.taskId]: true }))
+          toast('已切块：' + String(r.chunks) + ' 块，共 ' + String(r.chars) + ' 字')
+          await loadTasks()
+          const g = await rpc('learn.get', { taskId: r.taskId })
+          setTask(g)
+        } catch (e) {
+          setErr(String(e.message || e))
+        } finally {
+          setBusy('')
+        }
+      }
+
+      /** 删一个任务 */
+      const delTask = async (t) => {
+        if (!window.confirm('删除「' + String(t.name) + '」？\n\n会一并删掉这本书的切块、判定、精读结果和报告，不可恢复。')) return
+        try {
+          await rpc('learn.delete', { taskId: t.taskId })
+          if (task !== null && task.taskId === t.taskId) setTask(null)
+          toast('已删除：' + String(t.name))
+          await loadTasks()
+        } catch (e) {
+          setErr(String(e.message || e))
+        }
+      }
+
+      /** 清空全部任务 */
+      const clearAll = async () => {
+        if (tasks.length === 0) return
+        if (!window.confirm('清空全部 ' + String(tasks.length) + ' 个任务？\n\n所有上传的书、判定、精读结果都会删掉，不可恢复。')) return
+        setBusy('clear')
+        setErr('')
+        let n = 0
+        for (const t of tasks) {
+          try {
+            await rpc('learn.delete', { taskId: t.taskId })
+            n += 1
+          } catch {
+            /* 单个失败就跳过 */
+          }
+        }
+        setTask(null)
+        await loadTasks()
+        setBusy('')
+        toast('已清空 ' + String(n) + ' 个任务')
+      }
+
+      /**
+       * 刷新任务详情——强制打开，不做 toggle。
+       * 粗扫/精读/汇总跑完都要调它，如果复用带 toggle 的 openTask，
+       * 因为任务本来就开着，会被误判成「再点一次就收起」，于是每跑完一步面板就自己关了。
+       */
+      const reloadTask = async (id) => {
+        try {
+          const g = await rpc('learn.get', { taskId: id })
+          setTask(g)
+        } catch (e) {
+          setErr(String(e.message || e))
+        }
+      }
+
+      /** 任务行的「打开 / 收起」开关，只给按钮用 */
+      /** 把某本书的报告送到右栏 */
+      const showReport = (g) => {
+        if (typeof onResult !== 'function' || g === null || g === undefined) return
+        const md = String(g.reportMd === undefined || g.reportMd === null ? '' : g.reportMd)
+        if (md.trim() === '') return
+        onResult({ kind: 'book', title: '这本书的写法 · ' + String(g.meta !== undefined && g.meta !== null && g.meta.name ? g.meta.name : ''), text: md })
+      }
+
+      const openTask = async (id) => {
+        setShowVerdicts(false)
+        if (task !== null && task.taskId === id) {
+          setTask(null)
+          return
+        }
+        setBusy('open')
+        setErr('')
+        try {
+          const g = await rpc('learn.get', { taskId: id })
+          setTask(g)
+        showReport(g)
+        } catch (e) {
+          setErr(String(e.message || e))
+        } finally {
+          setBusy('')
+        }
+      }
+
+      /** 粗扫全部块（分批，可中断） */
+      const scanAll = async () => {
+        if (task === null) return
+        const total = task.verdicts.length
+        setBusy('scan')
+        setErr('')
+
+        // 「下一块从哪开始」必须按已扫过的最大序号算，不能拿「已判定条数」当序号：
+        // 模型一批可能只回 30 条判定，条数 < 实际扫过的块数，
+        // 用条数当 from 会反复重扫同一段，永远到不了终点。
+        const decidedIdx = task.verdicts.filter((v) => v.decided === true).map((v) => v.index)
+        let from = decidedIdx.length === 0 ? 0 : Math.max(...decidedIdx) + 1
+
+        try {
+          let guard = 0
+          const maxRounds = Math.ceil(total / 10) + 5
+          for (;;) {
+            guard += 1
+            if (guard > maxRounds) {
+              setErr('粗扫循环太多次，可能模型一直没返回完整判定。已扫的会保留，可以再点一次继续。')
+              break
+            }
+            setProgress('粗扫 ' + String(from) + '/' + String(total))
+            const r = await rpc('learn.scan', { taskId: task.taskId, from, batchSize: 40 })
+            // 后端说 done，或者这轮一条判定都没拿到且进度没前进，就停
+            if (r.done === true) break
+            if (Number(r.to) <= from) {
+              setErr('这一批没拿到判定，已停在 ' + String(from) + '/' + String(total) + '，再点一次会从断点继续。')
+              break
+            }
+            from = Number(r.to)
+          }
+          setProgress('')
+          await reloadTask(task.taskId)
+        } catch (e) {
+          setErr(String(e.message || e))
+          setProgress('')
+        } finally {
+          setBusy('')
+        }
+      }
+
+      /** 精读所有被判为重要的块 */
+      const digestAll = async () => {
+        if (task === null) return
+        const todo = task.verdicts.filter((v) => v.keep === true && v.digested !== true)
+        if (todo.length === 0) {
+          toast('没有待精读的块')
+          return
+        }
+        if (!window.confirm('要精读 ' + String(todo.length) + ' 块吗？\n\n会调用模型 ' + String(todo.length) + ' 次，中途可以停下。')) return
+        setBusy('digest')
+        setErr('')
+        let done = 0
+        for (const v of todo) {
+          setProgress('精读 ' + String(done) + '/' + String(todo.length))
+          try {
+            await rpc('learn.digest', { taskId: task.taskId, index: v.index })
+            done += 1
+          } catch (e) {
+            setErr('第 ' + String(v.index + 1) + ' 块失败：' + String(e.message || e))
+            break
+          }
+        }
+        setProgress('')
+        toast('精读完成 ' + String(done) + ' 块')
+        setBusy('')
+        await reloadTask(task.taskId)
+      }
+
+      const summarize = async () => {
+        if (task === null) return
+        setBusy('sum')
+        setErr('')
+        try {
+          await rpc('learn.summarize', { taskId: task.taskId })
+          toast('汇总完成')
+          await reloadTask(task.taskId)
+        } catch (e) {
+          setErr(String(e.message || e))
+        } finally {
+          setBusy('')
+        }
+      }
+
+      const keepCount = task === null ? 0 : task.verdicts.filter((v) => v.keep === true).length
+      const decidedCount = task === null ? 0 : task.verdicts.filter((v) => v.decided === true).length
+
+      // 行内元素多（勾选框 / 书名 / 类型 / 块 / 扫 / 读 / 报告 / 打开 / 删），左栏一窄就溢出到界面外。
+      // 允许换行：宽度够时还是一行，不够时下面的标签自动落到第二行，按钮永远在画面里。
+      const rowStyle = { display: 'flex', alignItems: 'center', gap: 6, rowGap: 5, flexWrap: 'wrap', padding: '6px 9px', borderRadius: 7, border: '1px solid ' + C.border, marginBottom: 4 }
+
+      return React.createElement(
+        'div',
+        { style: { ...cardStyle, padding: 14, marginBottom: 12 } },
+        React.createElement(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' } },
+          React.createElement('span', { style: { fontSize: 13, fontWeight: 700 } }, '📚 成品书库'),
+          React.createElement(Chip, null, String(tasks.length) + ' 本'),
+          React.createElement('div', { style: { flex: 1 } }),
+          React.createElement(
+            'label',
+            { style: { ...btn('primary'), display: 'inline-flex', alignItems: 'center', gap: 6, cursor: busy === '' ? 'pointer' : 'default' } },
+            busy === 'upload' ? '解析中…' : '选择文件',
+            React.createElement('input', {
+              type: 'file',
+              accept: '.txt,.md,.docx,.epub',
+              style: { display: 'none' },
+              onChange: (e) => {
+                const f = e.target.files !== null && e.target.files.length > 0 ? e.target.files[0] : null
+                if (f !== null) void upload(f)
+                e.target.value = ''
+              },
+            }),
+          ),
+        ),
+        React.createElement(
+          'div',
+          { style: { fontSize: 11, color: C.sub, lineHeight: 1.7, marginBottom: 10 } },
+          '一个书库存多本书：先粗扫挑段落 → 精读 → 汇总成每本的报告；勾选几本就能横向比出共同规律。支持 .txt / .md / .docx / .epub。',
+        ),
+
+        err === '' ? null : React.createElement('div', { style: { fontSize: 11.5, color: C.danger, marginBottom: 8, lineHeight: 1.7 } }, err),
+
+        progress === '' ? null : React.createElement('div', { style: { fontSize: 11, color: C.accent, marginBottom: 8 } }, progress + ' …'),
+
+        // 一键分析：勾选的书一次走完 粗扫 → 精读 → 汇总 → 融合
+        // 常驻：书库空了也要在，否则用户进来一片空白不知道点哪
+        React.createElement(
+              'div',
+              { style: { border: '1px solid ' + C.ok + '55', background: 'rgba(52,199,89,0.06)', borderRadius: 10, padding: '9px 10px', marginBottom: 8 } },
+              React.createElement(
+                'div',
+                { style: { display: 'flex', alignItems: 'center', gap: 8, rowGap: 4, flexWrap: 'wrap' } },
+                React.createElement('span', { style: { fontSize: 12.5, fontWeight: 700 } }, '⚡ 一键分析'),
+                React.createElement(Chip, { tone: pickedIds.length > 0 ? C.ok : C.sub }, '已选 ' + String(pickedIds.length) + ' 本'),
+                React.createElement('div', { style: { flex: 1 } }),
+                React.createElement(
+                  'button',
+                  {
+                    onClick: () => {
+                      const allOff = pickedIds.length === tasks.length
+                      const next = {}
+                      for (const t of tasks) {
+                        next[t.taskId] = allOff === false
+                        next['__touched__' + t.taskId] = true
+                      }
+                      setPicked(next)
+                    },
+                    disabled: busy !== '' || tasks.length === 0,
+                    style: { ...btn(), padding: '2px 8px', fontSize: 10.5 },
+                  },
+                  pickedIds.length === tasks.length ? '☐ 全不选' : '☑ 全选',
+                ),
+                React.createElement('div', { style: { flex: 1 } }),
+                busy === 'runall'
+                  ? React.createElement('button', { onClick: () => stopAll(), style: { ...btn('danger'), padding: '3px 10px', fontSize: 11 } }, '⏸ 停')
+                  : React.createElement(
+                      'button',
+                      {
+                        onClick: () => void startRunAll('full'),
+                        disabled: busy !== '' || pickedIds.length === 0,
+                        style: {
+                          ...btn('primary'),
+                          padding: '3px 12px',
+                          // 勾了书变绿，一眼看出「现在可以点了」
+                          ...(pickedIds.length > 0 && busy === ''
+                            ? { background: C.ok, borderColor: C.ok, color: '#fff', fontWeight: 700 }
+                            : {}),
+                        },
+                      },
+                      '▶ 一键分析（新书只扫没扫过的，最后合并成一套写法）',
+                    ),
+
+              ),
+              React.createElement(
+                'div',
+                { style: { fontSize: 10.5, color: C.sub, lineHeight: 1.7, marginTop: 5 } },
+                busy === 'runall'
+                  ? '正在跑，每步一次模型调用；中途可以停，进度都存着，再点会接着做。'
+                  : '点一次就够：新加的书只扫没扫过的部分（进度会接着上次），全部读完后自动合并成一套写法。',
+              ),
+              // 进度：有 progress 就显示这一本的扫/读/报告状态
+              runAll === null || runAll.progress === undefined || runAll.progress === null
+                ? React.createElement(
+                    'div',
+                    { style: { fontSize: 10.5, color: C.sub, lineHeight: 1.7, marginTop: 5 } },
+                    runAll === null || runAll.message === undefined ? '' : String(runAll.message),
+                  )
+                : React.createElement(
+                    'div',
+                    { style: { marginTop: 6 } },
+                    React.createElement(
+                      'div',
+                      { style: { fontSize: 11.5, lineHeight: 1.8 } },
+                      String(runAll.message === undefined ? '' : runAll.message),
+                    ),
+                    React.createElement(
+                      'div',
+                      { style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 4, flexWrap: 'wrap' } },
+                      React.createElement(Chip, { tone: C.accent }, '扫 ' + String(runAll.progress.scanned) + '/' + String(runAll.progress.total)),
+                      React.createElement(Chip, { tone: C.ok }, '读 ' + String(runAll.progress.digested)),
+                      React.createElement(Chip, { tone: runAll.progress.hasReport === true ? C.ok : C.sub }, runAll.progress.hasReport === true ? '有报告' : '待汇总'),
+                      React.createElement('span', { style: { fontSize: 10.5, color: C.sub } }, String(runAll.progress.book === undefined ? '' : runAll.progress.book)),
+                    ),
+                  ),
+              // 扫描结果：扫完之后挑中了哪些块、模型给的理由。
+              // 默认收起，只留一行「判定了 N 块、挑中 M 块」；点开才看逐块理由。
+              runAll === null || runAll.scans === undefined || runAll.scans.length === 0
+                ? null
+                : React.createElement(
+                    'div',
+                    { style: { marginTop: 8, borderTop: '1px dashed ' + C.border, paddingTop: 8 } },
+                    React.createElement(
+                      'button',
+                      {
+                        onClick: () => setShowScans((v) => v !== true),
+                        title: showScans === true ? '收起粗扫结果' : '展开看每一块为什么被挑中',
+                        style: {
+                          ...btn(),
+                          width: '100%',
+                          textAlign: 'left',
+                          padding: '5px 10px',
+                          fontSize: 11.5,
+                          // 一本书一行字就够了；书名多了会撑出左栏，多出来的用省略号收掉
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          display: 'block',
+                          ...(showScans === true ? { background: 'rgba(52,199,89,0.14)', borderColor: C.ok, color: C.ok, fontWeight: 600 } : {}),
+                        },
+                      },
+                      (showScans === true ? '▾ ' : '▸ ') +
+                        '🔍 粗扫结果：' +
+                        runAll.scans
+                          .map((sc) => String(sc.name) + ' 判 ' + String(sc.scanned) + '/挑 ' + String(sc.kept))
+                          .join('，') +
+                        (showScans === true ? '' : '　点击展开'),
+                    ),
+                    showScans !== true
+                      ? null
+                      : React.createElement(
+                    'div',
+                    { style: { marginTop: 6 } },
+                    ...runAll.scans.map((sc) =>
+                      React.createElement(
+                        'div',
+                        { key: 'sc' + String(sc.taskId), style: { marginBottom: 7 } },
+                        React.createElement(
+                          'div',
+                          { style: { fontSize: 11.5, marginBottom: 3 } },
+                          String(sc.name) + '：判定了 ' + String(sc.scanned) + ' 块，挑中 ' + String(sc.kept) + ' 块值得精读',
+                        ),
+                        sc.picked.length === 0
+                          ? React.createElement('div', { style: { fontSize: 10.5, color: C.sub } }, '（一块都没挑中：这本书可能不合口味，或者切片太碎）')
+                          : React.createElement(
+                              'div',
+                              { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
+                              ...sc.picked.map((p) =>
+                                React.createElement(
+                                  'div',
+                                  { key: 'pk' + String(sc.taskId) + '-' + String(p.i), style: { fontSize: 10.5, color: C.text, lineHeight: 1.6 } },
+                                  '· 第' + String(p.i + 1) + '块 ' + (p.title === undefined || p.title === '' ? '' : '「' + String(p.title) + '」') + (p.why === undefined || p.why === '' ? '' : ' — ' + String(p.why)),
+                                ),
+                              ),
+                            ),
+                      ),
+                    ),
+                  ),
+                  ),
+            ),
+
+        // 任务列表；空的时候给一句提示，别只剩一个按钮
+        tasks.length === 0
+          ? React.createElement(
+              'div',
+              { style: { fontSize: 11.5, color: C.sub, lineHeight: 1.9, padding: '10px 2px' } },
+              '书库还是空的。点右上角「选择文件」把 .txt / .md / .docx / .epub 放进来，',
+              '选进来的书会自动打勾，然后点上面「▶ 全部做完」就能一次跑完。',
+            )
+          : React.createElement(
+              'div',
+              { style: { marginBottom: 10 } },
+              React.createElement(
+                'div',
+                { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 5 } },
+                React.createElement('span', { style: { fontSize: 11, color: C.sub, flex: 1 } }, '以往的任务（' + String(tasks.length) + '）'),
+                React.createElement(
+                  'button',
+                  { onClick: () => void clearAll(), disabled: busy !== '', style: { ...btn('danger'), padding: '2px 9px', fontSize: 10.5 } },
+                  busy === 'clear' ? '清空中…' : '🗑 清空全部',
+                ),
+              ),
+              ...tasks.slice(0, 8).map((t) =>
+                React.createElement(
+                  'div',
+                  {
+                    key: t.taskId,
+                    // 双击整行打开/收起，不用去瞄那个小按钮
+                    onDoubleClick: () => void openTask(t.taskId),
+                    title: task !== null && task.taskId === t.taskId ? '双击收起' : '双击打开',
+                    style: {
+                      ...rowStyle,
+                      cursor: 'pointer',
+                      background: task !== null && task.taskId === t.taskId ? 'rgba(10,132,255,0.08)' : 'transparent',
+                    },
+                  },
+                  React.createElement('input', {
+                    type: 'checkbox',
+                    checked: picked[t.taskId] === true,
+                    title: '勾上就一起分析；不想要就取消勾',
+                    onChange: () => togglePick(t.taskId),
+                    style: { flexShrink: 0, cursor: 'pointer' },
+                  }),
+                  React.createElement(
+                    'span',
+                    {
+                      title: String(t.name),
+                      style: {
+                        fontSize: 12,
+                        flex: '1 1 140px',
+                        minWidth: 80,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                        userSelect: 'none',
+                      },
+                    },
+                    String(t.name),
+                  ),
+                  React.createElement(
+                    'button',
+                    {
+                      title: '设置这本书的类型与作者（融合时按类型看更有用）',
+                      onClick: async (e) => {
+                        e.stopPropagation()
+                        const type = window.prompt('这本书的类型（例如：兽人 / 都市 / 悬疑）', t.type === '' ? '' : t.type)
+                        if (type === null) return
+                        const author = window.prompt('作者（可留空）', t.author === '' ? '' : t.author)
+                        if (author === null) return
+                        try {
+                          await rpc('learn.setMeta', { taskId: t.taskId, type, author })
+                          await loadTasks()
+                          toast('已更新：' + String(t.name))
+                        } catch (err) {
+                          setErr(String(err.message || err))
+                        }
+                      },
+                      style: { ...btn(), padding: '1px 7px', fontSize: 10.5, color: t.type === '' ? C.sub : C.accent, borderColor: t.type === '' ? C.border : C.accent + '55' },
+                    },
+                    t.type === '' ? '＋ 类型' : String(t.type) + (t.author === '' ? '' : ' · ' + String(t.author)),
+                  ),
+                  // 四个标签永远都在，保证每行对齐；没跑到的用灰色，一眼看出进度
+                  React.createElement(Chip, { tone: C.sub }, String(t.chunks) + '块'),
+                  React.createElement(
+                    Chip,
+                    { tone: t.scanned > 0 ? C.ok : C.sub, style: { opacity: t.scanned > 0 ? 1 : 0.45 } },
+                    '扫' + String(t.scanned),
+                  ),
+                  React.createElement(
+                    Chip,
+                    { tone: t.digested > 0 ? C.accent : C.sub, style: { opacity: t.digested > 0 ? 1 : 0.45 } },
+                    '读' + String(t.digested),
+                  ),
+                  React.createElement(
+                    Chip,
+                    { tone: t.hasReport ? C.ok : C.sub, style: { opacity: t.hasReport ? 1 : 0.45 } },
+                    t.hasReport ? '有报告' : '无报告',
+                  ),
+                  React.createElement(
+                    'button',
+                    {
+                      onClick: () => void openTask(t.taskId),
+                      style: {
+                        ...btn(),
+                        padding: '1px 10px',
+                        fontSize: 10.5,
+                        fontWeight: task !== null && task.taskId === t.taskId ? 600 : 400,
+                        background: task !== null && task.taskId === t.taskId ? 'rgba(52,199,89,0.14)' : 'transparent',
+                        borderColor: task !== null && task.taskId === t.taskId ? C.ok : C.border,
+                        color: task !== null && task.taskId === t.taskId ? C.ok : C.text,
+                      },
+                    },
+                    task !== null && task.taskId === t.taskId ? '收起' : '打开',
+                  ),
+                  React.createElement(
+                    'button',
+                    { onClick: () => void delTask(t), disabled: busy !== '', title: '删除这个任务', style: { ...btn(), padding: '1px 7px', fontSize: 10.5, color: C.danger, borderColor: C.danger + '55' } },
+                    '✕',
+                  ),
+                ),
+              ),
+              tasks.length > 8
+                ? React.createElement('div', { style: { fontSize: 10, color: C.sub, padding: '2px 0' } }, '还有 ' + String(tasks.length - 8) + ' 个任务没显示（用「清空全部」一起删）')
+                : null,
+            ),
+
+        // 当前任务
+        task === null
+          ? null
+          : React.createElement(
+              'div',
+              null,
+              React.createElement(
+                'div',
+                { style: { fontSize: 12, fontWeight: 600, marginBottom: 4 } },
+                String(task.meta.name),
+                React.createElement('span', { style: { fontSize: 11, color: C.sub, fontWeight: 400, marginLeft: 8 } },
+                  String(task.meta.chunks) + ' 块 · ' + String(task.meta.chars) + ' 字 · 已判定 ' + String(decidedCount) + ' · 重要 ' + String(keepCount) + ' · 已精读 ' + String(task.digested)),
+              ),
+
+              // 步骤条：当前该点的高亮蓝色，做过的打勾，没到的灰掉
+              React.createElement(
+                'div',
+                { style: { display: 'flex', gap: 8, margin: '10px 0', flexWrap: 'wrap' } },
+                ...(function () {
+                  const scanDone = decidedCount >= task.verdicts.length && task.verdicts.length > 0
+                  const todoDigest = task.verdicts.filter((v) => v.keep === true && v.digested !== true).length
+                  const digestDone = keepCount > 0 && todoDigest === 0
+                  const hasReport = task.report !== null && task.reportMd !== ''
+                  const steps = [
+                    {
+                      key: 'scan',
+                      label: busy === 'scan' ? '粗扫中…' : '① 粗扫挑重要块',
+                      state: scanDone ? 'done' : busy === 'scan' ? 'active' : 'todo',
+                      enabled: busy === '' && !scanDone,
+                      onClick: () => void scanAll(),
+                    },
+                    {
+                      key: 'digest',
+                      label: busy === 'digest' ? '精读中…' : digestDone ? '② 精读已完成' : '② 精读 ' + String(todoDigest) + ' 块',
+                      state: digestDone ? 'done' : busy === 'digest' ? 'active' : decidedCount > 0 ? 'active' : 'todo',
+                      // 扫过一部分就能精读——不必等 100% 扫完，避免卡死
+                      enabled: busy === '' && keepCount > 0 && todoDigest > 0,
+                      onClick: () => void digestAll(),
+                    },
+                    {
+                      key: 'sum',
+                      label: busy === 'sum' ? '汇总中…' : hasReport ? '③ 报告已生成' : '③ 汇总成报告',
+                      state: hasReport ? 'done' : busy === 'sum' ? 'active' : digestDone ? 'active' : 'todo',
+                      enabled: busy === '' && digestDone,
+                      onClick: () => void summarize(),
+                    },
+                  ]
+                  return steps.map((s) => {
+                    const active = s.state === 'active'
+                    const done = s.state === 'done'
+                    return React.createElement(
+                      'button',
+                      {
+                        key: s.key,
+                        onClick: s.onClick,
+                        disabled: !s.enabled,
+                        style: {
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 6,
+                          padding: '6px 14px',
+                          borderRadius: 8,
+                          fontSize: 12,
+                          fontWeight: active ? 600 : 400,
+                          border: '1px solid ' + (active ? C.accent : done ? C.ok + '66' : C.border),
+                          background: active ? C.accent : done ? 'rgba(52,199,89,0.10)' : 'transparent',
+                          color: active ? '#fff' : done ? C.ok : C.sub,
+                          cursor: s.enabled ? 'pointer' : 'default',
+                          opacity: s.enabled || done ? 1 : 0.55,
+                        },
+                      },
+                      done ? '✓' : active ? '▸' : '○',
+                      s.label,
+                    )
+                  })
+                })(),
+              ),
+
+              // 扫描判定：默认收起，点一下才展开。
+              // 478 条铺在页面上太占地方，收起来只留一行；想看再点，展开后限高滚动。
+              decidedCount === 0
+                ? null
+                : React.createElement(
+                    'div',
+                    { style: { marginTop: 8 } },
+                    React.createElement(
+                      'button',
+                      {
+                        onClick: () => setShowVerdicts((v) => v !== true),
+                        title: showVerdicts === true ? '收起扫描判定' : '展开看模型逐块判了什么',
+                        style: {
+                          ...btn(),
+                          width: '100%',
+                          textAlign: 'left',
+                          padding: '5px 12px',
+                          fontSize: 11.5,
+                          ...(showVerdicts === true ? { background: 'rgba(52,199,89,0.14)', borderColor: C.ok, color: C.ok, fontWeight: 600 } : {}),
+                        },
+                      },
+                      (showVerdicts === true ? '▾ ' : '▸ ') + '🔍 扫描判定（' + String(decidedCount) + ' 块）',
+                      showVerdicts === true ? '，挑中的在后面精读' : '　点击展开',
+                    ),
+                    showVerdicts !== true
+                      ? null
+                      : React.createElement(
+                    'div',
+                    { style: { maxHeight: 300, overflowY: 'auto', overscrollBehavior: 'contain', border: '1px solid ' + C.border, borderRadius: 8, padding: 6, marginTop: 6 } },
+                      ...task.verdicts
+                        .filter((v) => v.decided === true)
+                        .map((v) =>
+                          React.createElement(
+                            'div',
+                            { key: 'vt' + String(v.index), style: { ...rowStyle, alignItems: 'flex-start', opacity: v.keep === true ? 1 : 0.55 } },
+                            React.createElement(Chip, { tone: v.keep === true ? C.ok : C.sub }, v.keep === true ? '重要' : '跳过'),
+                            React.createElement(
+                              'div',
+                              { style: { flex: 1, minWidth: 0 } },
+                              React.createElement('div', { style: { fontSize: 11.5, fontWeight: 600 } }, String(v.title) + '（' + String(v.chars) + ' 字）' + (v.digested === true ? ' ✓已精读' : '')),
+                              React.createElement('div', { style: { fontSize: 10.5, color: C.sub, lineHeight: 1.6 } }, String(v.why)),
+                            ),
+                          ),
+                        ),
+                      ),
+                  ),
+
+              // 报告
+              task.report === null || task.reportMd === ''
+                ? null
+                : React.createElement(
+                    'div',
+                    { style: { marginTop: 10, padding: 12, borderRadius: 8, background: C.rail, border: '1px solid ' + C.accent + '44' } },
+                    React.createElement(
+                      'div',
+                      { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 } },
+                      React.createElement('span', { style: { fontSize: 12.5, fontWeight: 700 } }, '📄 这本书的写法'),
+                      React.createElement('div', { style: { flex: 1 } }),
+                      React.createElement(
+                        'button',
+                        {
+                          onClick: () => onApply(task.reportMd),
+                          style: { ...btn('primary'), padding: '2px 10px', fontSize: 11 },
+                          title: '把这份报告写进偏好档案（直接落盘）',
+                        },
+                        '📥 追加到档案',
+                      ),
+                    ),
+                    React.createElement(
+                      'div',
+                      { style: { fontSize: 11.5, lineHeight: 1.9, whiteSpace: 'pre-wrap', maxHeight: 180, overflowY: 'auto', overflowX: 'hidden', paddingRight: 4 } },
+                      String(task.reportMd),
+                    ),
+                  ),
+            ),
+
+      )
+    }
+
+    /**
+     * 指令面板：一面「要 AI 做的」，一面「禁止 AI 做的」。
+     *
+     * 页面本身只放一个按钮——清单有二十几条，铺在页面上太吵；
+     * 点开是左右两栏，改完立刻落盘，不用点保存。
+     */
+    function RulesPage({ toast }) {
+      const [open, setOpen] = useState(false)
+      const [items, setItems] = useState([])
+      const [trash, setTrash] = useState([])
+      // 面板里切到「回收站」视图：删掉的指令在那，能恢复也能彻底删
+      const [showTrash, setShowTrash] = useState(false)
+      const [busy, setBusy] = useState(false)
+      const [loading, setLoading] = useState(true)
+      const [draftDo, setDraftDo] = useState('')
+      const [draftDont, setDraftDont] = useState('')
+
+      const load = useCallback(async () => {
+        setLoading(true)
+        try {
+          const d = await rpc('rules.get')
+          setItems(d.items || [])
+          setTrash(d.trash || [])
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setLoading(false)
+        }
+      }, [toast])
+
+      useEffect(() => {
+        void load()
+      }, [load])
+
+      const save = async (next) => {
+        setBusy(true)
+        try {
+          const d = await rpc('rules.save', { items: next })
+          setItems(d.items || [])
+        } catch (e) {
+          toast(String(e.message || e))
+          await load()
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const add = async (side) => {
+        const body = String(side === 'dont' ? draftDont : draftDo).trim()
+        if (body === '') return
+        if (side === 'dont') setDraftDont('')
+        else setDraftDo('')
+        await save([...items, { id: 'u' + String(Date.now()), side, text: body, on: true }])
+      }
+
+      /** 删一条 → 进回收站 */
+      const remove = async (id) => {
+        setBusy(true)
+        try {
+          const d = await rpc('rules.delete', { id })
+          setItems(d.items || [])
+          setTrash(d.trash || [])
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const restore = async (id) => {
+        setBusy(true)
+        try {
+          const d = await rpc('rules.restore', { id })
+          setItems(d.items || [])
+          setTrash(d.trash || [])
+          toast('已恢复，重新生效')
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const purge = async (id) => {
+        if (!window.confirm('彻底删除？这一步不可恢复。')) return
+        setBusy(true)
+        try {
+          const d = await rpc('rules.purge', { id })
+          setItems(d.items || [])
+          setTrash(d.trash || [])
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const purgeAll = async () => {
+        if (trash.length === 0) return
+        if (!window.confirm('清空回收站？\n\n会彻底删除 ' + String(trash.length) + ' 条指令，不可恢复。')) return
+        setBusy(true)
+        try {
+          const d = await rpc('rules.purgeAll')
+          setItems(d.items || [])
+          setTrash(d.trash || [])
+          toast('已清空 ' + String(d.removed) + ' 条')
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const reset = async () => {
+        if (!window.confirm('恢复出厂的 25 条？\n\n你自己加的会被清掉。')) return
+        setBusy(true)
+        try {
+          const d = await rpc('rules.reset')
+          setItems(d.items || [])
+          toast('已恢复出厂')
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const sideOf = (side) => items.filter((x) => (side === 'dont' ? x.side === 'dont' : x.side !== 'dont'))
+      const doList = sideOf('do')
+      const dontList = sideOf('dont')
+      const onDo = doList.filter((x) => x.on !== false).length
+      const onDont = dontList.filter((x) => x.on !== false).length
+
+      const sideColumn = (side) => {
+        const list = side === 'dont' ? dontList : doList
+        const tone = side === 'dont' ? C.danger : C.ok
+        const on = side === 'dont' ? onDont : onDo
+        return React.createElement(
+          'div',
+          { style: { flex: '1 1 0', minWidth: 0, height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden', borderRight: side === 'dont' ? '1px solid ' + C.border : 'none' } },
+          React.createElement(
+            'div',
+            { style: { padding: '8px 12px', borderBottom: '1px solid ' + C.border, background: C.rail, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6 } },
+            React.createElement('span', { style: { fontSize: 12.5, fontWeight: 700, color: tone } }, side === 'dont' ? '🚫 禁止 AI 做的' : '✅ 要 AI 做的'),
+            React.createElement('span', { style: { fontSize: 10.5, color: C.sub } }, String(on) + ' / ' + String(list.length) + ' 条启用'),
+          ),
+          React.createElement(
+            'div',
+            {
+              style: {
+                flex: '1 1 0',
+                minHeight: 0,
+                overflowY: 'auto',
+                overflowX: 'hidden',
+                overscrollBehavior: 'contain',
+                paddingBottom: 4,
+              },
+            },
+            list.length === 0
+              ? React.createElement('div', { style: { padding: 14, color: C.sub, fontSize: 11.5 } }, side === 'dont' ? '还没有禁止项。' : '还没有要求项。')
+              : list.map((it) =>
+                  React.createElement(
+                    'div',
+                    { key: it.id, style: { display: 'flex', alignItems: 'flex-start', gap: 8, padding: '7px 12px', borderBottom: '1px solid ' + C.border, opacity: it.on === false ? 0.45 : 1, flexShrink: 0 } },
+                    React.createElement('input', {
+                      type: 'checkbox',
+                      checked: it.on !== false,
+                      disabled: busy,
+                      onChange: () => void save(items.map((x) => (x.id === it.id ? { ...x, on: x.on === false } : x))),
+                      style: { marginTop: 3, cursor: 'pointer' },
+                    }),
+                    React.createElement('span', { style: { flex: 1, minWidth: 0, fontSize: 12, lineHeight: 1.75 } }, it.text),
+                    React.createElement(
+                      'button',
+                      {
+                        onClick: () => void remove(it.id),
+                        disabled: busy,
+                        title: '删到回收站（可恢复）',
+                        style: { ...btn('danger'), padding: '0 6px', fontSize: 10.5, lineHeight: '18px', flexShrink: 0 },
+                      },
+                      '🗑',
+                    ),
+                  ),
+                ),
+          ),
+          React.createElement(
+            'div',
+            { style: { padding: '8px 12px', borderTop: '1px solid ' + C.border, display: 'flex', gap: 6, flexShrink: 0 } },
+            React.createElement('textarea', {
+              value: side === 'dont' ? draftDont : draftDo,
+              rows: 2,
+              onChange: (e) => (side === 'dont' ? setDraftDont(e.target.value) : setDraftDo(e.target.value)),
+              onKeyDown: (e) => {
+                // 回车提交，Shift+回车换行——一行装不下的长句也能看清楚再发
+                if (e.key === 'Enter' && e.shiftKey !== true) {
+                  e.preventDefault()
+                  void add(side)
+                }
+              },
+              placeholder: side === 'dont' ? '再加一条不许做的（回车添加，Shift+回车换行）' : '再加一条要做的（回车添加，Shift+回车换行）',
+              style: {
+                flex: 1,
+                minWidth: 0,
+                resize: 'none',
+                padding: '6px 8px',
+                fontSize: 12,
+                lineHeight: 1.7,
+                fontFamily: 'inherit',
+                color: C.text,
+                background: 'transparent',
+                border: '1px solid ' + C.border,
+                borderRadius: 7,
+                outline: 'none',
+              },
+            }),
+            React.createElement('button', { onClick: () => void add(side), disabled: busy, style: { ...btn('primary'), padding: '6px 10px', fontSize: 11.5, alignSelf: 'stretch' } }, '＋ 加'),
+          ),
+        )
+      }
+
+      const panel =
+        open !== true
+          ? null
+          : React.createElement(
+              'div',
+              {
+                style: { position: 'fixed', inset: 0, zIndex: 960, background: 'rgba(0,0,0,0.42)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 },
+                onMouseDown: (e) => {
+                  if (e.target === e.currentTarget) {
+                    setOpen(false)
+                    setShowTrash(false)
+                  }
+                },
+              },
+              React.createElement(
+                'div',
+                { style: { width: 'min(1040px, 100%)', height: 'min(760px, calc(100vh - 40px))', minHeight: 0, display: 'flex', flexDirection: 'column', background: C.card, color: C.text, border: '1px solid ' + C.border, borderRadius: 12, boxShadow: '0 24px 70px rgba(0,0,0,0.45)', overflow: 'hidden' } },
+                React.createElement(
+                  'div',
+                  { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderBottom: '1px solid ' + C.border, flexShrink: 0 } },
+                  React.createElement('span', { style: { fontSize: 13.5, fontWeight: 700 } }, '📌 指令'),
+                  React.createElement('span', { style: { fontSize: 11, color: C.sub } }, '写稿时这两栏都会喂给模型，优先级高于写作包；改完立刻生效'),
+                  React.createElement('div', { style: { flex: 1 } }),
+                  React.createElement(
+                    'button',
+                    {
+                      onClick: () => setShowTrash(!showTrash),
+                      disabled: busy,
+                      title: '删掉的指令都在这里，能恢复',
+                      style: {
+                        ...btn(),
+                        padding: '2px 9px',
+                        fontSize: 11,
+                        ...(showTrash
+                          ? { color: C.accent, borderColor: C.accent + '66', background: 'rgba(10,132,255,0.10)' }
+                          : trash.length > 0
+                            ? { color: '#f59e0b', borderColor: 'rgba(245,158,11,0.55)' }
+                            : {}),
+                      },
+                    },
+                    '🗑 回收站' + (trash.length > 0 ? '（' + String(trash.length) + '）' : ''),
+                  ),
+                  React.createElement('button', { onClick: () => void reset(), disabled: busy, style: { ...btn(), padding: '2px 9px', fontSize: 11 } }, '↺ 恢复出厂'),
+                  React.createElement(
+                    'button',
+                    {
+                      onClick: () => {
+                        setOpen(false)
+                        setShowTrash(false)
+                      },
+                      style: { ...btn(), padding: '2px 9px', fontSize: 11 },
+                    },
+                    '关闭',
+                  ),
+                ),
+                showTrash
+                  ? React.createElement(
+                      'div',
+                      { style: { flex: '1 1 0', minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' } },
+                      React.createElement(
+                        'div',
+                        { style: { padding: '8px 14px', borderBottom: '1px solid ' + C.border, background: C.rail, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 8 } },
+                        React.createElement('span', { style: { fontSize: 12.5, fontWeight: 700 } }, '🗑 指令回收站'),
+                        React.createElement('span', { style: { fontSize: 10.5, color: C.sub } }, String(trash.length) + ' 条 · 删掉的不会进提示词，恢复后立刻重新生效'),
+                        React.createElement('div', { style: { flex: 1 } }),
+                        React.createElement('button', { onClick: () => void purgeAll(), disabled: busy || trash.length === 0, style: { ...btn('danger'), padding: '2px 9px', fontSize: 11 } }, '清空回收站'),
+                      ),
+                      React.createElement(
+                        'div',
+                        { style: { flex: '1 1 0', minHeight: 0, overflowY: 'auto', overflowX: 'hidden', overscrollBehavior: 'contain', paddingBottom: 4 } },
+                        trash.length === 0
+                          ? React.createElement('div', { style: { padding: 20, color: C.sub, fontSize: 11.5, textAlign: 'center' } }, '空的。删掉的指令会先到这里，可以恢复。')
+                          : trash.map((it) =>
+                              React.createElement(
+                                'div',
+                                { key: 't' + it.id, style: { display: 'flex', alignItems: 'flex-start', gap: 8, padding: '8px 14px', borderBottom: '1px solid ' + C.border, flexShrink: 0 } },
+                                React.createElement('span', { style: { fontSize: 10.5, fontWeight: 700, color: it.side === 'dont' ? C.danger : C.ok, flexShrink: 0, marginTop: 2 } }, it.side === 'dont' ? '禁止' : '要做'),
+                                React.createElement('span', { style: { flex: 1, minWidth: 0, fontSize: 12, lineHeight: 1.75 } }, it.text),
+                                React.createElement('button', { onClick: () => void restore(it.id), disabled: busy, style: { ...btn(), padding: '0 8px', fontSize: 10.5, lineHeight: '20px', flexShrink: 0, color: C.accent, borderColor: C.accent + '55' } }, '恢复'),
+                                React.createElement('button', { onClick: () => void purge(it.id), disabled: busy, style: { ...btn('danger'), padding: '0 6px', fontSize: 10.5, lineHeight: '20px', flexShrink: 0 } }, '✕ 彻底删'),
+                              ),
+                            ),
+                      ),
+                    )
+                  : React.createElement('div', { style: { flex: '1 1 0', minHeight: 0, overflow: 'hidden', display: 'flex' } }, sideColumn('dont'), sideColumn('do')),
+              ),
+            )
+
+      return React.createElement(
+        'div',
+        { style: { display: 'flex', flexDirection: 'column', gap: 10, minHeight: 0 } },
+        React.createElement(
+          'div',
+          { style: { ...cardStyle, padding: 14, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
+          React.createElement('span', { style: { fontSize: 13.5, fontWeight: 700 } }, '📌 指令'),
+          React.createElement(Chip, { tone: C.ok }, '要做 ' + String(onDo) + ' 条'),
+          React.createElement(Chip, { tone: C.danger }, '禁止 ' + String(onDont) + ' 条'),
+          React.createElement('div', { style: { flex: 1 } }),
+          React.createElement(
+            'button',
+            {
+              onClick: () => {
+                // 每次打开都回到两栏视图：上次停在回收站，关掉再开不该还停在回收站
+                setShowTrash(false)
+                setOpen(true)
+              },
+              style: btn('primary'),
+            },
+            loading ? '读取中…' : '打开指令面板',
+          ),
+        ),
+        React.createElement(
+          'div',
+          { style: { ...cardStyle, padding: '10px 14px', fontSize: 11.5, color: C.sub, lineHeight: 1.9 } },
+          '一开始没有偏好也没关系：这一份就是底线，左边禁止 AI 做的，右边要求 AI 做的，写每一章都会带上。',
+        ),
+        panel,
+      )
+    }
+
+    function ProfilePage({ state, onRefresh, toast }) {
+      const [text, setText] = useState('')
+      const [before, setBefore] = useState('')
+      const [types, setTypes] = useState([])
+      const [typeTrash, setTypeTrash] = useState([])
+      const [showTrash, setShowTrash] = useState(false)
+      const [busy, setBusy] = useState(false)
+      // 作品分析弹窗：左选书/分析，右看结论
+      const [libOpen, setLibOpen] = useState(false)
+      const [libResult, setLibResult] = useState(null)
+      // ── 提炼规律 ──
+      const [pen, setPen] = useState(null) // { total, good, bad, pending }
+      const [distillResult, setDistillResult] = useState(null) // { rules: [], model, usedSegments }
+      const [distillPicked, setDistillPicked] = useState({})
+      const [distilling, setDistilling] = useState(false)
+      const textRef = useRef('')
+      const beforeRef = useRef('')
+      const saveRef2 = useRef(null)
+      textRef.current = text
+      beforeRef.current = before
+
+      useEffect(() => {
+        leaveFlow.add('profile', {
+          get: () => ({
+            dirty: textRef.current !== beforeRef.current,
+            label: '作者偏好档案',
+            save: () => (saveRef2.current === null ? Promise.resolve() : saveRef2.current()),
+          }),
+        })
+        return () => leaveFlow.add('profile', null)
+      }, [])
+
+      const loadPending = useCallback(async () => {
+        try {
+          const d = await rpc('distill.pending')
+          setPen(d)
+        } catch {
+          setPen(null)
+        }
+      }, [])
+
+      useEffect(() => {
+        void loadPending()
+      }, [loadPending])
+
+      const runDistill = async () => {
+        if (pen !== null && pen.total === 0) {
+          window.alert('全书还没有标注：先在候选稿里逐段点 👍 / 👎，再回来提炼。')
+          return
+        }
+        const tip =
+          pen === null
+            ? '开始提炼？'
+            : pen.pending > 0
+              ? '有 ' + String(pen.pending) + ' 条新标注待提炼。\n\n会调一次模型，把标注压成规律。继续？'
+              : '没有新标注，会用全部 ' + String(pen.total) + ' 条重提炼一次。\n\n继续？'
+        if (!window.confirm(tip)) return
+        setDistilling(true)
+        setDistillResult(null)
+        try {
+          const d = await rpc('distill.run')
+          const picked = {}
+          for (const r of d.rules) picked[r.id] = true
+          setDistillResult(d)
+          setDistillPicked(picked)
+        } catch (e) {
+          window.alert(String(e.message || e))
+        } finally {
+          setDistilling(false)
+        }
+      }
+
+      const applyDistill = async () => {
+        if (distillResult === null) return
+        const chosen = distillResult.rules.filter((r) => distillPicked[r.id] === true)
+        if (chosen.length === 0) {
+          window.alert('一条都没选')
+          return
+        }
+        setBusy(true)
+        try {
+          const d = await rpc('distill.apply', { rules: chosen })
+          window.alert('已写进档案：新增 ' + String(d.added) + ' 条（好 ' + String(d.addedGood) + ' · 坏 ' + String(d.addedBad) + '）')
+          setDistillResult(null)
+          await load()
+          await loadPending()
+          onRefresh()
+        } catch (e) {
+          window.alert(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const load = useCallback(async () => {
+        setBusy(true)
+        try {
+          const [p, t] = await Promise.all([rpc('profile.get'), rpc('types.list')])
+          setText(p.text)
+          setBefore(p.text)
+          setTypes(t.types || [])
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }, [toast])
+
+      useEffect(() => {
+        void load()
+      }, [load])
+
+      const save = async () => {
+        setBusy(true)
+        try {
+          const d = await rpc('profile.save', { text, dedupe: true })
+          const removed = Array.isArray(d.removed) ? d.removed : []
+          if (removed.length > 0) {
+            // 后端已经把重复条目删掉了，这里同步回显
+            const fresh = await rpc('profile.get')
+            setText(String(fresh.text))
+            setBefore(String(fresh.text))
+            toast('已保存，并合并了 ' + String(removed.length) + ' 条重复：' + removed.slice(0, 3).join('；') + (removed.length > 3 ? ' 等' : ''))
+            onRefresh()
+          } else {
+            setBefore(text)
+            toast('档案已保存')
+            onRefresh()
+          }
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      saveRef2.current = save
+
+      /**
+       * 清掉旧版本留下的说明行（「由 dsh-novel-craft …」「候选目录：…」那几条）。
+       * 只删以 > 开头、且含这些特征的行，别的引用块动。
+       */
+      const cleanLegacy = async () => {
+        const lines = String(text).split('\n')
+        const out = []
+        let dropped = 0
+        for (const line of lines) {
+          const t = line.trim()
+          if (
+            t.startsWith('>') &&
+            (/dsh-novel-craft/u.test(t) || /候选目录：/u.test(t) || /原文证据在/u.test(t) || /自动块（begin/u.test(t))
+          ) {
+            dropped += 1
+            continue
+          }
+          out.push(line)
+        }
+        if (dropped === 0) {
+          toast('没找到旧说明行')
+          return
+        }
+        setText(out.join('\n').replace(/\n{3,}/gu, '\n\n'))
+        toast('已清掉 ' + String(dropped) + ' 行旧说明，点「保存档案」生效')
+      }
+
+      const clear = async () => {
+        const boundType = state !== null && state.profile !== undefined ? String(state.profile.type || '') : ''
+        const ask =
+          boundType === ''
+            ? '清空当前档案？\n\n旧档案会先备份到 .dsh-novel-studio/备份/，然后回到最初那份说明。'
+            : '当前档案是类型「' + boundType + '」共用的，同类型的书都读它。\n\n清空后旧档案会备份到 .dsh-novel-studio/备份/，并回到最初那份说明。确定吗？'
+        if (!window.confirm(ask)) return
+        setBusy(true)
+        try {
+          const d = await rpc('profile.clear')
+          // 立刻回显：不等下一轮 load，编辑框当场变回最初说明
+          if (typeof d.text === 'string') {
+            setText(d.text)
+            setBefore(d.text)
+          }
+          toast('已清空，回到最初说明' + (d.backup ? '；旧档案备份在 ' + String(d.backup) : ''))
+          await load()
+          onRefresh()
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const bindType = async (name) => {
+        setBusy(true)
+        try {
+          await rpc('types.bind', { name })
+          toast(name === '' ? '已解绑' : '已绑定类型「' + name + '」')
+          await load()
+          onRefresh()
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const createType = async () => {
+        const name = window.prompt('新建类型（例如：兽人校园、都市重生）\n\n同类型的书共用这份偏好档案。')
+        if (name === null || String(name).trim() === '') return
+        setBusy(true)
+        try {
+          await rpc('types.create', { name: String(name).trim() })
+          toast('类型已创建并绑定')
+          await load()
+          onRefresh()
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const saveAs = async () => {
+        const name = window.prompt('把当前档案存为类型：', state !== null && state.profile !== undefined ? String(state.profile.type || '') : '')
+        if (name === null || String(name).trim() === '') return
+        setBusy(true)
+        try {
+          await rpc('types.saveAs', { name: String(name).trim() })
+          await rpc('types.bind', { name: String(name).trim() })
+          toast('已存为类型并绑定')
+          await load()
+          onRefresh()
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const delType = async () => {
+        const cur = state !== null && state.profile !== undefined ? String(state.profile.type || '') : ''
+        if (cur === '') return
+        if (!window.confirm('删除类型「' + cur + '」？\n\n整个类型移到类型回收站，本书解绑。')) return
+        setBusy(true)
+        try {
+          await rpc('types.delete', { name: cur })
+          toast('已移入类型回收站')
+          await load()
+          onRefresh()
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const loadTypeTrash = async () => {
+        try {
+          const d = await rpc('types.trashList')
+          setTypeTrash(d.items || [])
+          setShowTrash(true)
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+      /** 进来先静默读一次，让「♻ 类型回收站」按钮上能显示数量 */
+      useEffect(() => {
+        void (async () => {
+          try {
+            const d = await rpc('types.trashList')
+            setTypeTrash(d.items || [])
+          } catch {
+            /* 读不到就当空的，不打扰 */
+          }
+        })()
+      }, [])
+
+      const restoreType = async (item) => {
+        if (!window.confirm('恢复类型「' + item.typeName + '」？')) return
+        try {
+          await rpc('types.trashRestore', { name: item.dirName })
+          const d = await rpc('types.trashList')
+          setTypeTrash(d.items || [])
+          await load()
+          toast('已恢复类型「' + item.typeName + '」')
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+      const purgeType = async (item) => {
+        if (!window.confirm('彻底删除类型「' + item.typeName + '」？\n\n不可恢复。')) return
+        try {
+          await rpc('types.trashPurge', { name: item.dirName })
+          const d = await rpc('types.trashList')
+          setTypeTrash(d.items || [])
+          toast('已彻底删除')
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+      const purgeTypeAll = async () => {
+        if (typeTrash.length === 0) return
+        if (!window.confirm('清空类型回收站？\n\n会彻底删除 ' + String(typeTrash.length) + ' 个类型，不可恢复。')) return
+        try {
+          await rpc('types.trashPurgeAll')
+          setTypeTrash([])
+          toast('已清空')
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+      const currentType = state !== null && state.profile !== undefined ? String(state.profile.type || '') : ''
+
+      return React.createElement(React.Fragment, null,
+        React.createElement(
+        'div',
+        { style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, gap: 10, overflowY: 'auto', overflowX: 'hidden', paddingRight: 2 } },
+        // 类型条
+        React.createElement(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap', padding: '8px 10px', ...cardStyle, flexShrink: 0 } },
+          React.createElement('span', { style: { fontSize: 11.5, color: C.sub } }, '本书类型'),
+          React.createElement(
+            'select',
+            {
+              value: currentType,
+              disabled: busy,
+              onChange: (e) => void bindType(e.target.value),
+              style: { ...inputStyle, padding: '3px 7px' },
+            },
+            currentType === '' ? React.createElement('option', { value: '', disabled: true }, types.length === 0 ? '还没有类型' : '— 选一个类型 —') : null,
+            ...types.map((x) => React.createElement('option', { key: x.name, value: x.name }, x.name + (x.chars > 0 ? '（' + String(x.chars) + ' 字）' : '（空）'))),
+          ),
+          React.createElement('button', { onClick: () => void createType(), disabled: busy, style: { ...btn(), padding: '3px 9px', fontSize: 11.5 } }, '＋ 新建类型'),
+          React.createElement('button', { onClick: () => void saveAs(), disabled: busy, style: { ...btn(), padding: '3px 9px', fontSize: 11.5 } }, '存为类型'),
+          React.createElement('button', { onClick: () => void clear(), disabled: busy, style: { ...btn('danger'), padding: '3px 9px', fontSize: 11.5 } }, '清空档案'),
+          currentType === '' ? null : React.createElement('button', { onClick: () => void delType(), disabled: busy, style: { ...btn('danger'), padding: '3px 9px', fontSize: 11.5 } }, '✕ 删除类型'),
+          React.createElement(
+            'button',
+            {
+              onClick: () => void loadTypeTrash(),
+              disabled: busy,
+              title: '删掉的类型都在这里，可以恢复或彻底删',
+              style: {
+                ...btn(),
+                padding: '3px 9px',
+                fontSize: 11.5,
+                // 里面有东西就点亮，别让人以为这个按钮只是个摆设
+                ...(typeTrash.length > 0 ? { color: '#f59e0b', borderColor: 'rgba(245,158,11,0.55)', background: 'rgba(245,158,11,0.08)' } : {}),
+              },
+            },
+            '♻ 类型回收站' + (typeTrash.length > 0 ? '（' + String(typeTrash.length) + '）' : ''),
+          ),
+          React.createElement('div', { style: { flex: 1 } }),
+          text !== before ? React.createElement(Chip, { tone: C.warn }, '未保存') : null,
+          React.createElement('button', { onClick: () => void save(), disabled: busy || text === before, style: btn('primary') }, '保存档案'),
+        ),
+        // 作品分析：原先整块书库铺在这里太密，收进一个按钮
+        React.createElement(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', ...cardStyle, flexShrink: 0, flexWrap: 'wrap' } },
+          React.createElement(
+            'button',
+            { onClick: () => setLibOpen(true), style: { ...btn('primary'), padding: '4px 12px' } },
+            '📊 作品分析',
+          ),
+          React.createElement(
+            'span',
+            { style: { fontSize: 11.5, color: C.sub, lineHeight: 1.7, flex: 1, minWidth: 200 } },
+            '成品书库 · 一键分析 · 每本书的写法',
+          ),
+        ),
+        // 提炼工具条
+        React.createElement(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px', ...cardStyle, flexShrink: 0, flexWrap: 'wrap' } },
+          React.createElement(
+            'button',
+            { onClick: () => void runDistill(), disabled: distilling || busy, style: btn('primary') },
+            distilling ? '提炼中…' : '✨ 提炼规律',
+          ),
+          pen === null
+            ? React.createElement('span', { style: { fontSize: 11.5, color: C.sub } }, '读不到标注')
+            : React.createElement(
+                'span',
+                { style: { fontSize: 11.5, color: C.sub } },
+                '全书 ' + String(pen.total) + ' 条标注（👍' + String(pen.good) + ' · 👎' + String(pen.bad) + '）',
+                pen.pending > 0
+                  ? React.createElement('span', { style: { color: C.warn, marginLeft: 8 } }, String(pen.pending) + ' 条待提炼')
+                  : React.createElement('span', { style: { color: C.ok, marginLeft: 8 } }, '都提炼过了'),
+              ),
+          React.createElement('div', { style: { flex: 1 } }),
+          React.createElement('span', { style: { fontSize: 11, color: C.sub } }, '把标好的段落压成规律，直接写进下面这份档案'),
+        ),
+        // 档案正文
+        React.createElement(
+          'div',
+          { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', ...cardStyle, overflow: 'hidden' } },
+          // 路径条 + 行内保存：编辑框很长，滚到底点保存太麻烦，这里给一个常驻入口
+          React.createElement(
+            'div',
+            { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '5px 11px', borderBottom: '1px solid ' + C.border, flexShrink: 0 } },
+            React.createElement(
+              'span',
+              { style: { flex: 1, minWidth: 0, fontSize: 10.5, color: C.sub, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+              state !== null && state.profile !== undefined && state.profile.path !== '' ? String(state.profile.path) : '（还没定位到档案）',
+            ),
+            text !== before ? React.createElement(Chip, { tone: C.warn }, '未保存') : null,
+            React.createElement(
+              'button',
+              {
+                onClick: () => void save(),
+                disabled: busy || text === before,
+                title: text === before ? '没有改动' : '把编辑框内容写进文件',
+                style: { ...btn(text !== before ? 'primary' : undefined), padding: '2px 10px', fontSize: 11, flexShrink: 0 },
+              },
+              busy ? '保存中…' : '💾 保存档案',
+            ),
+          ),
+          React.createElement('textarea', {
+            value: text,
+            onChange: (e) => setText(e.target.value),
+            placeholder: '在这里写能复用的写作规律：作者喜欢什么、讨厌什么。写稿时会读这一份。',
+            style: { flex: 1, minHeight: 0, resize: 'none', border: 'none', outline: 'none', padding: '10px 12px', fontSize: 12.5, lineHeight: 1.9, background: 'transparent', color: C.text, fontFamily: 'inherit' },
+          }),
+        ),
+        // 类型回收站：改成居中弹层，别再塞在页面最底下（第一次根本看不见）
+        showTrash
+          ? React.createElement(
+              'div',
+              {
+                style: { position: 'fixed', inset: 0, zIndex: 958, background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 },
+                onMouseDown: (e) => {
+                  if (e.target === e.currentTarget) setShowTrash(false)
+                },
+              },
+              React.createElement(
+                'div',
+                { style: { width: 'min(620px, 100%)', maxHeight: '80vh', display: 'flex', flexDirection: 'column', background: C.card, color: C.text, border: '1px solid ' + C.border, borderRadius: 12, boxShadow: '0 24px 70px rgba(0,0,0,0.4)', overflow: 'hidden' } },
+                React.createElement(
+                  'div',
+                  { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '11px 14px', borderBottom: '1px solid ' + C.border, flexShrink: 0 } },
+                  React.createElement('span', { style: { fontSize: 13.5, fontWeight: 700 } }, '♻ 类型回收站'),
+                  React.createElement(Chip, null, String(typeTrash.length) + ' 个'),
+                  React.createElement('div', { style: { flex: 1 } }),
+                  React.createElement('button', { onClick: () => void purgeTypeAll(), disabled: typeTrash.length === 0, style: { ...btn('danger'), padding: '2px 9px', fontSize: 11 } }, '清空全部'),
+                  React.createElement('button', { onClick: () => setShowTrash(false), style: { ...btn(), padding: '2px 9px', fontSize: 11 } }, '关闭'),
+                ),
+                React.createElement('div', { style: { fontSize: 11, color: C.sub, padding: '8px 14px', borderBottom: '1px solid ' + C.border, flexShrink: 0 } }, '删掉的类型整个放在这里（含它的全部内容），能恢复，也能彻底删。'),
+                React.createElement(
+                  'div',
+                  { style: { overflow: 'auto', flex: 1, minHeight: 0 } },
+                  typeTrash.length === 0
+                    ? React.createElement('div', { style: { padding: 20, color: C.sub, fontSize: 11.5, textAlign: 'center' } }, '还没有删过类型')
+                    : typeTrash.map((it) =>
+                        React.createElement(
+                          'div',
+                          { key: it.dirName, style: { display: 'flex', alignItems: 'center', gap: 8, padding: '8px 14px', borderBottom: '1px solid ' + C.border } },
+                          React.createElement('div', { style: { flex: 1, minWidth: 0 } }, it.typeName + '　', React.createElement('span', { style: { color: C.sub, fontSize: 10.5 } }, fmtTime(it.stamp) + '　' + String(it.chars) + ' 字')),
+                          React.createElement('button', { onClick: () => void restoreType(it), style: { ...btn(), padding: '2px 8px', fontSize: 11, color: C.accent, borderColor: C.accent + '55' } }, '恢复'),
+                          React.createElement('button', { onClick: () => void purgeType(it), style: { ...btn('danger'), padding: '2px 8px', fontSize: 11 } }, '✕ 彻底删'),
+                        ),
+                      ),
+                ),
+              ),
+            )
+          : null,
+        // ── 提炼结果：勾选要采纳的规律 ──
+        distillResult === null
+          ? null
+          : React.createElement(
+              'div',
+              {
+                style: {
+                  position: 'fixed',
+                  inset: 0,
+                  zIndex: 950,
+                  background: 'rgba(0,0,0,0.30)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  padding: 20,
+                },
+                onMouseDown: (e) => {
+                  if (e.target === e.currentTarget && distilling !== true) setDistillResult(null)
+                },
+              },
+              React.createElement(
+                'div',
+                {
+                  style: {
+                    width: 'min(680px, 100%)',
+                    maxHeight: '100%',
+                    background: C.card,
+                    border: '1px solid ' + C.border,
+                    borderRadius: 12,
+                    boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    overflow: 'hidden',
+                  },
+                },
+                React.createElement(
+                  'div',
+                  { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderBottom: '1px solid ' + C.border, flexShrink: 0 } },
+                  React.createElement('span', { style: { fontWeight: 700, fontSize: 13 } }, '✨ 提炼结果'),
+                  React.createElement(Chip, null, distillResult.rules.length + ' 条'),
+                  React.createElement(Chip, null, '用了 ' + distillResult.usedSegments + ' 段标注'),
+                  React.createElement('div', { style: { flex: 1 } }),
+                  React.createElement('button', { onClick: () => setDistillResult(null), style: { ...btn(), padding: '2px 9px', fontSize: 11.5 } }, '关闭'),
+                ),
+                React.createElement(
+                  'div',
+                  { style: { flex: 1, minHeight: 0, overflow: 'auto', padding: 12 } },
+                  React.createElement('div', { style: { fontSize: 11.5, color: C.sub, marginBottom: 8 } }, '勾掉不像你口味的；剩下的会写进「已验证偏好 / 避免的写法」。'),
+                  ...distillResult.rules.map((r) =>
+                    React.createElement(
+                      'div',
+                      {
+                        key: r.id,
+                        style: {
+                          display: 'flex',
+                          gap: 8,
+                          alignItems: 'flex-start',
+                          padding: '7px 9px',
+                          marginBottom: 5,
+                          border: '1px solid ' + (r.mark === 'good' ? C.ok + '55' : C.danger + '55'),
+                          borderRadius: 8,
+                          background: r.mark === 'good' ? 'rgba(52,199,89,0.06)' : 'rgba(255,59,48,0.05)',
+                        },
+                      },
+                      React.createElement('input', {
+                        type: 'checkbox',
+                        checked: distillPicked[r.id] === true,
+                        onChange: (e) => setDistillPicked({ ...distillPicked, [r.id]: e.target.checked }),
+                        style: { marginTop: 4 },
+                      }),
+                      React.createElement(
+                        'div',
+                        { style: { flex: 1, minWidth: 0 } },
+                        React.createElement(
+                          'div',
+                          { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+                          React.createElement(Chip, { tone: r.mark === 'good' ? C.ok : C.danger }, r.mark === 'good' ? '👍 要这样' : '👎 别这样'),
+                          React.createElement('span', { style: { fontSize: 12.5, lineHeight: 1.7 } }, r.text),
+                        ),
+                        r.evidence.length === 0
+                          ? null
+                          : React.createElement(
+                              'details',
+                              { style: { marginTop: 3 } },
+                              React.createElement('summary', { style: { fontSize: 10.5, color: C.sub, cursor: 'pointer' } }, '来自 ' + String(r.evidence.length) + ' 段'),
+                              ...r.evidence.map((ev, i) =>
+                                React.createElement(
+                                  'div',
+                                  { key: 'ev' + String(i), style: { fontSize: 10.5, color: C.sub, lineHeight: 1.7, marginTop: 3, paddingLeft: 8, borderLeft: '2px solid ' + C.border } },
+                                  '第' + String(ev.chapter) + '章 ' + String(ev.file).replace(/\.txt$/iu, '') + ' · 第' + String(ev.index + 1) + '段：' + ev.text,
+                                ),
+                              ),
+                            ),
+                      ),
+                    ),
+                  ),
+                ),
+                React.createElement(
+                  'div',
+                  { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '9px 14px', borderTop: '1px solid ' + C.border, flexShrink: 0 } },
+                  React.createElement('span', { style: { flex: 1, fontSize: 11, color: C.sub } }, '模型：' + String(distillResult.model)),
+                  React.createElement('button', { onClick: () => void applyDistill(), disabled: busy, style: btn('primary') },
+                    '采纳 ' + String(distillResult.rules.filter((r) => distillPicked[r.id] === true).length) + ' 条写进档案'),
+                ),
+              ),
+            ),
+      ),
+        // 作品分析弹窗
+        libOpen
+          ? React.createElement(AnalysisModal, {
+              toast,
+              onClose: () => setLibOpen(false),
+              onResult: (r) => setLibResult(r),
+              onApply: async (md) => {
+                if (text !== before) {
+                  if (!window.confirm('编辑框里有还没保存的改动。\n\n继续追加会用磁盘上的档案覆盖这些改动，确定吗？')) return
+                }
+                const block = '<!-- 来源：成品小说分析 -->\n' + String(md).trim()
+                try {
+                  const d = await rpc('profile.append', { text: block })
+                  // 追加是直接写文件的，编辑框得跟着刷新——不然要等下次进页面才看得见
+                  const fresh = await rpc('profile.get')
+                  setText(String(fresh.text))
+                  setBefore(String(fresh.text))
+                  onRefresh()
+                  setLibOpen(false)
+                  toast(d.skipped === true ? '这段已经在档案里了，编辑框已同步' : '已写进档案（' + String(d.chars) + ' 字），编辑框已同步')
+                } catch (e) {
+                  toast(String(e.message || e))
+                }
+              },
+              initial: libResult,
+            })
+          : null,
+      )
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // 情节体检页
+    // ══════════════════════════════════════════════════════════
+    function PlotPage({ toast }) {
+      const [data, setData] = useState(null)
+      const [loading, setLoading] = useState(true)
+      const [showAllDebts, setShowAllDebts] = useState(false)
+      // 一致性检查（纯规则，不花钱）
+      const [cons, setCons] = useState(null)
+      const [headBusy, setHeadBusy] = useState(false)
+      // 别称建议
+      const [aliasSug, setAliasSug] = useState(null)
+      const [aliasBusy, setAliasBusy] = useState(false)
+      // 建卡弹窗：null = 关着，否则 { name, card, busy, err }
+      const [cardMaker, setCardMaker] = useState(null)
+      // 正在让模型猜哪个字段（空字符串 = 没在猜）
+      const [guessBusy, setGuessBusy] = useState('')
+
+      const load = async () => {
+        setLoading(true)
+        try {
+          const d = await rpc('plot.analysis')
+          setData(d)
+          const c = await rpc('consistency.check')
+          setCons(c)
+          const al = await rpc('people.suggestAliases', { minHits: 3 })
+          setAliasSug(al)
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setLoading(false)
+        }
+      }
+
+      useEffect(() => {
+        void load()
+      }, [])
+
+      /** 把一条别称写进角色卡 */
+      const adoptAlias = async (c) => {
+        setAliasBusy(true)
+        try {
+          await rpc('people.setAliases', { name: c.name, add: [c.alias] })
+          toast('已把「' + String(c.alias) + '」记到 ' + String(c.name) + ' 名下')
+          const al = await rpc('people.suggestAliases', { minHits: 3 })
+          setAliasSug(al)
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setAliasBusy(false)
+        }
+      }
+
+      /** 打开建卡弹窗 */
+      const openCardMaker = (name) => {
+        setCardMaker({
+          name,
+          // 只给一个姓名的空壳。字段该有哪些，交给模型按书的类型判断，
+          // 或者由作者自己加——这个插件不只服务兽人小说。
+          card: { 姓名: name },
+          busy: false,
+          err: '',
+        })
+      }
+
+      /** 让模型读前文生成草稿 */
+      const genCard = async () => {
+        if (cardMaker === null) return
+        setCardMaker((c) => ({ ...c, busy: true, err: '' }))
+        try {
+          const r = await rpc('people.cardDraft', { name: cardMaker.name })
+          setCardMaker((c) => ({ ...c, card: r.card, busy: false, evidence: r.evidence }))
+          toast('已根据前文生成，检查一遍再保存')
+        } catch (e) {
+          setCardMaker((c) => ({ ...c, busy: false, err: String(e.message || e) }))
+        }
+      }
+
+      /** 写盘 */
+      const saveCard = async () => {
+        if (cardMaker === null) return
+        setCardMaker((c) => ({ ...c, busy: true, err: '' }))
+        try {
+          await rpc('people.cardSave', { name: cardMaker.name, card: cardMaker.card })
+          toast('已建卡：' + String(cardMaker.name))
+          setCardMaker(null)
+          await load()
+        } catch (e) {
+          setCardMaker((c) => ({ ...c, busy: false, err: String(e.message || e) }))
+        }
+      }
+
+      /** 让模型猜某一个字段 */
+      const guessField = async (field) => {
+        if (cardMaker === null) return
+        setGuessBusy(field)
+        try {
+          const cur = cardMaker.card[field]
+          const r = await rpc('people.fieldGuess', {
+            name: cardMaker.name,
+            field,
+            current: typeof cur === 'string' ? cur : '',
+          })
+          setCardMaker((c) => (c === null ? c : { ...c, card: { ...c.card, [field]: r.value } }))
+          toast(field + ' → ' + String(r.value))
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setGuessBusy('')
+        }
+      }
+
+      /** 改一个字段 */
+      const setCardField = (k, v) => {
+        setCardMaker((c) => (c === null ? c : { ...c, card: { ...c.card, [k]: v } }))
+      }
+
+      /** 给所有缺头部的总结补结构化头（只补头，不重写正文） */
+      const fillHeads = async () => {
+        const m = await rpc('summary.headsMissing')
+        if (m.missing.length === 0) {
+          toast('所有总结都有索引头了')
+          return
+        }
+        if (!window.confirm('有 ' + String(m.missing.length) + ' 章总结缺索引头。\n\n会调 ' + String(m.missing.length) + ' 次模型，只补头部、不改正文。继续？')) return
+        setHeadBusy(true)
+        let done = 0
+        for (const it of m.missing) {
+          try {
+            const r = await rpc('summary.fillHead', { chapter: it.chapter })
+            if (r.skipped !== true) done += 1
+          } catch (e) {
+            toast('第' + String(it.chapter) + '章失败：' + String(e.message || e))
+          }
+        }
+        setHeadBusy(false)
+        toast('已补 ' + String(done) + ' 章索引头')
+        await load()
+      }
+
+      if (loading) return React.createElement(Empty, null, '正在分析全书…这要读完所有章节，可能要几秒')
+      if (data === null) return React.createElement(Empty, null, '分析失败')
+
+      const tensions = data.tensions || []
+      const issues = data.issues || []
+      const debts = data.debts || []
+      const shown = showAllDebts ? debts : debts.slice(0, 20)
+      const over = data.overdueCount === undefined ? 0 : data.overdueCount
+
+      return React.createElement(
+        'div',
+        { style: { height: '100%', overflow: 'auto', display: 'flex', flexDirection: 'column', gap: 12 } },
+        // 张力曲线
+        React.createElement(
+          'div',
+          { style: { ...cardStyle, padding: '12px 14px', flexShrink: 0 } },
+          React.createElement(
+            'div',
+            { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 } },
+            React.createElement('span', { style: { fontSize: 13, fontWeight: 700 } }, '📈 张力曲线'),
+            React.createElement(Chip, null, String(data.stats.chapters) + ' 章'),
+            React.createElement(Chip, null, '剧情总结 ' + String(data.stats.summaries)),
+            React.createElement('div', { style: { flex: 1 } }),
+            React.createElement('button', { onClick: () => void load(), style: { ...btn(), padding: '2px 9px', fontSize: 11 } }, '↻ 重新分析'),
+          ),
+          React.createElement('div', { style: { fontSize: 10.5, color: C.sub, marginBottom: 8 } }, '按正文里的冲突信号估的，不是你的判断。虚线部分尤其只作参考。'),
+          ...tensions.map((t) =>
+            React.createElement(
+              'div',
+              { key: 't' + String(t.chapter), style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3 } },
+              React.createElement('span', { style: { width: 52, fontSize: 11, color: C.sub, textAlign: 'right', flexShrink: 0 } }, '第' + String(t.chapter) + '章'),
+              React.createElement(
+                'div',
+                { style: { flex: 1, height: 14, background: 'rgba(0,0,0,0.05)', borderRadius: 4, overflow: 'hidden', position: 'relative' } },
+                React.createElement('div', {
+                  style: {
+                    width: Math.round((t.value / 5) * 100) + '%',
+                    height: '100%',
+                    background: t.value >= 4 ? C.danger : t.value >= 3 ? C.warn : C.accent,
+                    opacity: t.source === 'manual' ? 1 : 0.55,
+                    borderRadius: 4,
+                  },
+                }),
+              ),
+              React.createElement('span', { style: { width: 30, fontSize: 11, color: C.sub, flexShrink: 0 } }, String(t.value) + ' 分'),
+              React.createElement(Chip, { tone: t.source === 'manual' ? C.ok : undefined }, t.source === 'manual' ? '你标的' : '估'),
+            ),
+          ),
+        ),
+        // 结构问题
+        React.createElement(
+          'div',
+          { style: { ...cardStyle, padding: '12px 14px', flexShrink: 0 } },
+          React.createElement(
+            'div',
+            { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 } },
+            React.createElement('span', { style: { fontSize: 13, fontWeight: 700 } }, '🔍 结构问题'),
+            React.createElement(Chip, null, String(issues.length) + ' 条'),
+          ),
+          issues.length === 0
+            ? React.createElement('div', { style: { fontSize: 11.5, color: C.sub } }, '没查出结构问题')
+            : React.createElement(
+                'div',
+                null,
+                ...issues.map((x, i) =>
+                  React.createElement(
+                    'div',
+                    {
+                      key: 'i' + String(i),
+                      style: {
+                        padding: '7px 9px',
+                        marginBottom: 5,
+                        borderRadius: 8,
+                        border: '1px solid ' + (x.level === 'warn' ? C.warn + '55' : C.border),
+                        background: x.level === 'warn' ? 'rgba(255,159,10,0.07)' : 'transparent',
+                      },
+                    },
+                    React.createElement(
+                      'div',
+                      { style: { display: 'flex', gap: 6, alignItems: 'center', marginBottom: 3 } },
+                      React.createElement(Chip, { tone: x.level === 'warn' ? C.warn : C.sub }, x.level === 'warn' ? '⚠ 注意' : 'ℹ 提示'),
+                      React.createElement('span', { style: { fontSize: 11.5, fontWeight: 600 } }, String(x.code)),
+                      x.chapter === null || x.chapter === undefined ? null : React.createElement(Chip, null, '第' + String(x.chapter) + '章'),
+                    ),
+                    React.createElement('div', { style: { fontSize: 11.5, color: C.sub, lineHeight: 1.8 } }, String(x.message)),
+                  ),
+                ),
+              ),
+        ),
+        // 一致性检查
+        cons === null
+          ? null
+          : React.createElement(
+              'div',
+              { style: { ...cardStyle, padding: '12px 14px', flexShrink: 0 } },
+              React.createElement(
+                'div',
+                { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' } },
+                React.createElement('span', { style: { fontSize: 13, fontWeight: 700 } }, '🔗 一致性检查'),
+                React.createElement(Chip, { tone: cons.issues.length === 0 ? C.ok : C.warn }, cons.issues.length === 0 ? '没问题' : cons.issues.length + ' 条'),
+                React.createElement('div', { style: { flex: 1 } }),
+                headBusy
+                  ? React.createElement(Chip, { tone: C.accent }, '正在补索引头…')
+                  : React.createElement(
+                      'button',
+                      { onClick: () => void fillHeads(), disabled: headBusy, style: { ...btn(), padding: '2px 9px', fontSize: 11 } },
+                      '✚ 补全索引头',
+                    ),
+              ),
+              React.createElement(
+                'div',
+                { style: { fontSize: 10.5, color: C.sub, marginBottom: 8, lineHeight: 1.7 } },
+                '纯规则检查，不调模型、不花钱：总结有没有漏记人、有没有人没卡、总结的索引头齐不齐。',
+              ),
+              cons.issues.length === 0
+                ? React.createElement('div', { style: { fontSize: 11.5, color: C.ok } }, '没查出问题')
+                : React.createElement(
+                    'div',
+                    null,
+                    ...cons.issues.map((x, i) =>
+                      React.createElement(
+                        'div',
+                        {
+                          key: 'ci' + String(i),
+                          style: {
+                            padding: '7px 9px',
+                            marginBottom: 5,
+                            borderRadius: 8,
+                            border: '1px solid ' + (x.level === 'warn' ? C.warn + '55' : C.border),
+                            background: x.level === 'warn' ? 'rgba(255,159,10,0.07)' : 'transparent',
+                          },
+                        },
+                        React.createElement(
+                          'div',
+                          { style: { display: 'flex', gap: 6, alignItems: 'center', marginBottom: 3 } },
+                          React.createElement(Chip, { tone: x.level === 'warn' ? C.warn : C.sub }, x.level === 'warn' ? '⚠ 注意' : 'ℹ 提示'),
+                          React.createElement('span', { style: { fontSize: 11.5, fontWeight: 600 } }, String(x.code)),
+                        ),
+                        React.createElement('div', { style: { fontSize: 11.5, color: C.sub, lineHeight: 1.8 } }, String(x.message)),
+                        // 无卡角色：每个名字挂一个「建卡」按钮
+                        x.code === '无卡角色' && cons.names !== undefined && cons.names.length > 0
+                          ? React.createElement(
+                              'div',
+                              { style: { display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 6 } },
+                              ...cons.names.map((n) =>
+                                React.createElement(
+                                  'button',
+                                  {
+                                    key: 'mk-' + String(n),
+                                    onClick: () => void openCardMaker(String(n)),
+                                    style: { ...btn(), padding: '1px 9px', fontSize: 11, color: C.accent, borderColor: C.accent + '55' },
+                                  },
+                                  '✚ ' + String(n),
+                                ),
+                              ),
+                            )
+                          : null,
+                        x.code === '未登场'
+                          ? React.createElement(
+                              'div',
+                              { style: { fontSize: 10.5, color: C.sub, marginTop: 6 } },
+                              '这些是规划里的后手，还没写到。不用急。',
+                            )
+                          : null,
+                      ),
+                    ),
+                  ),
+            ),
+        // 建卡弹窗
+        cardMaker === null
+          ? null
+          : React.createElement(
+              'div',
+              {
+                style: {
+                  position: 'fixed',
+                  inset: 0,
+                  zIndex: 1200,
+                  background: 'rgba(0,0,0,0.45)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  padding: 20,
+                },
+                onClick: () => setCardMaker(null),
+              },
+              React.createElement(
+                'div',
+                {
+                  onClick: (e) => e.stopPropagation(),
+                  style: {
+                    width: 'min(620px, 100%)',
+                    maxHeight: '82vh',
+                    overflow: 'auto',
+                    background: C.bg,
+                    color: C.text,
+                    borderRadius: 14,
+                    border: '1px solid ' + C.border,
+                    boxShadow: '0 20px 60px rgba(0,0,0,0.35)',
+                  },
+                },
+                // 标题
+                React.createElement(
+                  'div',
+                  { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '12px 14px', borderBottom: '1px solid ' + C.border } },
+                  React.createElement('span', { style: { fontSize: 13, fontWeight: 700 } }, '给「' + String(cardMaker.name) + '」建卡'),
+                  React.createElement('div', { style: { flex: 1 } }),
+                  React.createElement('button', { onClick: () => setCardMaker(null), style: { ...btn(), padding: '2px 9px', fontSize: 11 } }, '关闭'),
+                ),
+                // 内容
+                React.createElement(
+                  'div',
+                  { style: { padding: '12px 14px' } },
+                  React.createElement(
+                    'div',
+                    { style: { fontSize: 11.5, color: C.sub, lineHeight: 1.8, marginBottom: 10 } },
+                    '模型会读他出场的正文段落，也会查世界观、人物设定、写作口径、细纲这些设定资料，再生成卡片——设定和正文冲突时以设定为准，生成后还能改。',
+                  ),
+                  React.createElement(
+                    'button',
+                    { onClick: () => void genCard(), disabled: cardMaker.busy, style: { ...btn('primary'), marginBottom: 12 } },
+                    cardMaker.busy ? '模型在读前文和设定…' : '✨ 读前文 + 设定生成',
+                  ),
+                  cardMaker.evidence === undefined
+                    ? null
+                    : React.createElement(
+                        'div',
+                        { style: { fontSize: 10.5, color: C.sub, marginBottom: 10 } },
+                        '读了第 ' + cardMaker.evidence.chapters.join('、') + ' 章的 ' + String(cardMaker.evidence.paragraphs) + ' 段，大纲 ' + String(cardMaker.evidence.outlineHits) + ' 处',
+                        cardMaker.evidence.settingFiles === undefined || cardMaker.evidence.settingFiles.length === 0
+                          ? '，设定资料里没有提到他'
+                          : '，设定资料 ' + String(cardMaker.evidence.settingFiles.length) + ' 份（' + cardMaker.evidence.settingFiles.join('、') + '）共 ' + String(cardMaker.evidence.settingHits) + ' 处',
+                      ),
+                  cardMaker.err === ''
+                    ? null
+                    : React.createElement('div', { style: { fontSize: 11.5, color: C.danger, marginBottom: 10, lineHeight: 1.7 } }, cardMaker.err),
+                  // 字段：按这张卡实际有的 key 渲染，不预设任何题材专属字段
+                  ...Object.keys(cardMaker.card).map((k) => {
+                    const long = /备注|说明|描述|外形|外貌|背景|关系|其他/u.test(k)
+                    const val = cardMaker.card[k]
+                    const text = typeof val === 'string' ? val : JSON.stringify(val)
+                    return React.createElement(
+                      'div',
+                      { key: 'cf-' + k, style: { marginBottom: 9 } },
+                      React.createElement(
+                        'div',
+                        { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 } },
+                        React.createElement('span', { style: { fontSize: 11, color: C.sub } }, k),
+                        React.createElement(
+                          'button',
+                          {
+                            onClick: () => void guessField(k),
+                            disabled: guessBusy !== '',
+                            title: '让模型按前文猜一个值',
+                            style: {
+                              border: '1px solid ' + C.accent + '55',
+                              background: guessBusy === k ? C.accent : 'transparent',
+                              color: guessBusy === k ? '#fff' : C.accent,
+                              borderRadius: 5,
+                              fontSize: 10,
+                              lineHeight: 1,
+                              padding: '2px 5px',
+                              cursor: guessBusy !== '' ? 'default' : 'pointer',
+                            },
+                          },
+                          guessBusy === k ? '…' : '✨',
+                        ),
+                        Object.keys(cardMaker.card).length > 1 && k !== '姓名'
+                          ? React.createElement(
+                              'button',
+                              {
+                                onClick: () => {
+                                  const next = { ...cardMaker.card }
+                                  delete next[k]
+                                  setCardMaker((c) => (c === null ? c : { ...c, card: next }))
+                                },
+                                style: { border: 'none', background: 'transparent', color: C.sub, fontSize: 10, cursor: 'pointer', padding: 0 },
+                                title: '删掉这个字段',
+                              },
+                              '✕',
+                            )
+                          : null,
+                      ),
+                      long
+                        ? React.createElement('textarea', {
+                            value: text,
+                            onChange: (e) => setCardField(k, e.target.value),
+                            style: { ...inputStyle, width: '100%', minHeight: 90, resize: 'vertical', lineHeight: 1.8, fontFamily: 'inherit' },
+                          })
+                        : React.createElement('input', {
+                            value: text,
+                            onChange: (e) => setCardField(k, e.target.value),
+                            style: { ...inputStyle, width: '100%' },
+                          }),
+                    )
+                  }),
+                  React.createElement(
+                    'button',
+                    {
+                      onClick: () => {
+                        const n = window.prompt('新字段叫什么？（例如：职业、年龄、门派、可疑之处）')
+                        if (n === null || n.trim() === '') return
+                        setCardField(n.trim(), '')
+                      },
+                      style: { ...btn(), padding: '2px 10px', fontSize: 11, marginBottom: 4 },
+                    },
+                    '＋ 添加字段',
+                  ),
+                ),
+                // 底部
+                React.createElement(
+                  'div',
+                  { style: { display: 'flex', gap: 8, padding: '10px 14px', borderTop: '1px solid ' + C.border } },
+                  React.createElement('div', { style: { flex: 1, fontSize: 10.5, color: C.sub } }, '保存后写进 人物/' + String(cardMaker.name) + '.json'),
+                  React.createElement(
+                    'button',
+                    { onClick: () => void saveCard(), disabled: cardMaker.busy, style: btn('primary') },
+                    cardMaker.busy ? '保存中…' : '保存这张卡',
+                  ),
+                ),
+              ),
+            ),
+        // 别称建议
+        aliasSug === null || aliasSug.candidates.length === 0
+          ? null
+          : React.createElement(
+              'div',
+              { style: { ...cardStyle, padding: '12px 14px', flexShrink: 0 } },
+              React.createElement(
+                'div',
+                { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' } },
+                React.createElement('span', { style: { fontSize: 13, fontWeight: 700 } }, '👤 别称识别'),
+                React.createElement(Chip, { tone: C.accent }, aliasSug.candidates.length + ' 个候选'),
+                React.createElement('div', { style: { flex: 1 } }),
+                aliasBusy ? React.createElement(Chip, { tone: C.accent }, '写入中…') : null,
+              ),
+              React.createElement(
+                'div',
+                { style: { fontSize: 10.5, color: C.sub, marginBottom: 8, lineHeight: 1.7 } },
+                '从正文里猜出来的称呼。采纳后，写作包与一致性检查都会把「' + '李哥' + '」当成「李满」。标「冲突」的是同一个称呼命中多人，选一个。',
+              ),
+              ...aliasSug.candidates.slice(0, 20).map((c, i) =>
+                React.createElement(
+                  'div',
+                  {
+                    key: 'al' + String(i),
+                    style: {
+                      padding: '6px 9px',
+                      marginBottom: 4,
+                      borderRadius: 6,
+                      border: '1px solid ' + (c.suggested === true ? C.ok + '55' : c.conflict === true ? C.warn + '55' : C.border),
+                      background: c.suggested === true ? 'rgba(52,199,89,0.06)' : c.conflict === true ? 'rgba(255,159,10,0.06)' : 'transparent',
+                    },
+                  },
+                  React.createElement(
+                    'div',
+                    { style: { display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' } },
+                    React.createElement(
+                      Chip,
+                      { tone: c.suggested === true ? C.ok : c.conflict === true ? C.warn : undefined },
+                      c.suggested === true ? '✓ 建议选它' : c.conflict === true ? '⚠ 说不准是谁' : c.hits + ' 次',
+                    ),
+                    React.createElement('span', { style: { fontSize: 12 } }, String(c.name) + ' ← 「' + String(c.alias) + '」'),
+                    c.conflict === true ? React.createElement('span', { style: { fontSize: 10, color: C.sub } }, '(可能是 ' + String(c.owners.join(' / ')) + ')') : null,
+                    React.createElement('div', { style: { flex: 1 } }),
+                    React.createElement(
+                      'button',
+                      { onClick: () => void adoptAlias(c), disabled: aliasBusy, style: { ...btn(), padding: '1px 8px', fontSize: 10.5, color: C.accent, borderColor: C.accent + '55' } },
+                      '采纳',
+                    ),
+                  ),
+                  // 冲突项把上下文摊开，作者自己看是谁在叫谁
+                  c.conflict !== true || c.contexts === undefined || c.contexts.length === 0
+                    ? null
+                    : React.createElement(
+                        'div',
+                        { style: { marginTop: 4, paddingLeft: 4 } },
+                        c.guess === undefined || c.guess === null
+                          ? null
+                          : React.createElement(
+                              'div',
+                              { style: { fontSize: 10, color: c.suggested === true ? C.ok : C.sub, marginBottom: 2 } },
+                              '上下文里常一起出现的是「' + String(c.guess) + '」，倾向指他。',
+                            ),
+                        ...c.contexts.slice(0, 2).map((ctx, k) =>
+                          React.createElement(
+                            'div',
+                            { key: 'ctx' + String(k), style: { fontSize: 10, color: C.sub, lineHeight: 1.7, marginTop: 2 } },
+                            '第' + String(ctx.chapter) + '章 …' + String(ctx.before) + '【' + String(ctx.alias) + '】' + String(ctx.after) + '…' +
+                              (ctx.nearNames.length === 0 ? '' : '　附近：' + ctx.nearNames.join('、')),
+                          ),
+                        ),
+                      ),
+                ),
+              ),
+            ),
+        // 伏笔清单
+        React.createElement(
+          'div',
+          { style: { ...cardStyle, padding: '12px 14px', flexShrink: 0 } },
+          React.createElement(
+            'div',
+            { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' } },
+            React.createElement('span', { style: { fontSize: 13, fontWeight: 700 } }, '🪝 伏笔清单'),
+            React.createElement(Chip, { tone: over > 0 ? C.warn : C.ok }, String(over) + ' 条未收'),
+            React.createElement(Chip, null, '共 ' + String(debts.length) + ' 条'),
+            React.createElement('div', { style: { flex: 1 } }),
+            debts.length > 20
+              ? React.createElement('button', { onClick: () => setShowAllDebts(!showAllDebts), style: { ...btn(), padding: '2px 9px', fontSize: 11 } }, showAllDebts ? '只看前 20 条' : '显示全部 ' + String(debts.length) + ' 条')
+              : null,
+          ),
+          React.createElement(
+            'div',
+            { style: { fontSize: 10.5, color: C.sub, marginBottom: 8, lineHeight: 1.7 } },
+            '按大纲里「埋 / 收」两栏的名字配对的。名字换了叫法就配不上，所以这里既有真漏收，也有解析噪音——宁可多报，你自己筛。',
+          ),
+          debts.length === 0
+            ? React.createElement('div', { style: { fontSize: 11.5, color: C.sub } }, '大纲里没读到「埋」和「收」')
+            : React.createElement(
+                'div',
+                null,
+                ...shown.map((d, i) =>
+                  React.createElement(
+                    'div',
+                    {
+                      key: 'd' + String(i),
+                      style: {
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        padding: '5px 9px',
+                        marginBottom: 3,
+                        borderRadius: 6,
+                        border: '1px solid ' + (d.overdue === true ? C.warn + '44' : C.border),
+                        background: d.overdue === true ? 'rgba(255,159,10,0.05)' : 'transparent',
+                      },
+                    },
+                    React.createElement(Chip, { tone: d.paidChapter === null || d.paidChapter === undefined ? (d.overdue === true ? C.warn : C.sub) : C.ok }, d.paidChapter === null || d.paidChapter === undefined ? '未收' : '已收'),
+                    React.createElement('span', { style: { flex: 1, minWidth: 0, fontSize: 11.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, String(d.name)),
+                    React.createElement('span', { style: { fontSize: 10.5, color: C.sub, flexShrink: 0 } },
+                      '第' + String(d.plantedChapter) + '章埋' +
+                      (d.paidChapter === null || d.paidChapter === undefined ? (d.overdue === true ? ' · 欠 ' + String(d.openChapters) + ' 章' : '') : ' · 第' + String(d.paidChapter) + '章收')),
+                  ),
+                ),
+                debts.length > shown.length
+                  ? React.createElement('div', { style: { fontSize: 10.5, color: C.sub, marginTop: 6 } }, '还有 ' + String(debts.length - shown.length) + ' 条没显示')
+                  : null,
+              ),
+        ),
+      )
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // 设定页
+    // ══════════════════════════════════════════════════════════
+    function FilesPage({ toast }) {
+      const [tree, setTree] = useState([])
+      const [loading, setLoading] = useState(true)
+      const [open, setOpen] = useState({})
+      const [picked, setPicked] = useState(null)
+      const [text, setText] = useState('')
+      const [editing, setEditing] = useState(false)
+      const [draft, setDraft] = useState('')
+      const [busy, setBusy] = useState(false)
+      const [newDir, setNewDir] = useState(null)
+      const [renaming, setRenaming] = useState(null)
+
+      const load = useCallback(async () => {
+        setLoading(true)
+        try {
+          const d = await rpc('tree.list')
+          setTree(Array.isArray(d.tree) ? d.tree : [])
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setLoading(false)
+        }
+      }, [toast])
+
+      useEffect(() => {
+        void load()
+      }, [load])
+
+      const openFile = async (node) => {
+        setPicked(node)
+        setEditing(false)
+        setBusy(true)
+        try {
+          const d = await rpc('file.read', { path: node.path })
+          setText(typeof d.text === 'string' ? d.text : '')
+        } catch (e) {
+          setText('读不了这个文件：' + String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const saveFile = async () => {
+        if (picked === null) return
+        setBusy(true)
+        try {
+          await rpc('file.save', { path: picked.path, text: draft })
+          setText(draft)
+          setEditing(false)
+          toast('已保存：' + picked.name)
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const submitNewDir = async () => {
+        if (newDir === null) return
+        try {
+          const d = await rpc('dir.create', { parent: newDir.parent, name: newDir.name })
+          setOpen((prev) => ({ ...prev, [newDir.parent]: true, [d.path]: true }))
+          setNewDir(null)
+          toast('已建文件夹：' + d.path)
+          void load()
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+      const submitRename = async () => {
+        if (renaming === null) return
+        try {
+          const d = await rpc('path.rename', { from: renaming.path, name: renaming.name })
+          if (picked !== null && picked.path === renaming.path) {
+            setPicked({ type: 'file', name: renaming.name, path: d.path })
+          }
+          setRenaming(null)
+          toast('已重命名')
+          void load()
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+      const iconBtn = {
+        border: 'none',
+        background: 'transparent',
+        color: C.sub,
+        cursor: 'pointer',
+        fontSize: 12,
+        padding: '0 3px',
+        lineHeight: 1,
+        flexShrink: 0,
+      }
+
+      const smallBtn = (kind) => ({ ...btn(kind), padding: '1px 7px', fontSize: 11, marginLeft: 4 })
+
+      const nameEditor = (value, onChange, onOk, onCancel) =>
+        React.createElement(
+          React.Fragment,
+          null,
+          React.createElement('input', {
+            value,
+            autoFocus: true,
+            onChange: (e) => onChange(e.target.value),
+            onKeyDown: (e) => {
+              if (e.key === 'Enter') onOk()
+              if (e.key === 'Escape') onCancel()
+            },
+            style: { ...inputStyle, flex: 1, minWidth: 0 },
+          }),
+          React.createElement('button', { onClick: onOk, style: smallBtn('primary') }, '确定'),
+          React.createElement('button', { onClick: onCancel, style: smallBtn() }, '取消'),
+        )
+
+      const renderNodes = (nodes, depth) => {
+        if (!Array.isArray(nodes)) return null
+        return nodes.map((node) => {
+          const pad = 8 + depth * 14
+          if (node.type === 'dir') {
+            const isOpen = open[node.path] !== false
+            const isRenaming = renaming !== null && renaming.path === node.path
+            return React.createElement(
+              React.Fragment,
+              { key: 'd-' + node.path },
+              React.createElement(
+                'div',
+                { style: { display: 'flex', alignItems: 'center', gap: 2, padding: '4px 8px 4px ' + String(pad) + 'px' } },
+                isRenaming
+                  ? nameEditor(
+                      renaming.name,
+                      (v) => setRenaming({ path: node.path, name: v }),
+                      () => void submitRename(),
+                      () => setRenaming(null),
+                    )
+                  : React.createElement(
+                      React.Fragment,
+                      null,
+                      React.createElement(
+                        'span',
+                        {
+                          onClick: () => setOpen((prev) => ({ ...prev, [node.path]: !(prev[node.path] !== false) })),
+                          style: { flex: 1, minWidth: 0, cursor: 'pointer', fontSize: 12.5, fontWeight: 600, color: C.text, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+                        },
+                        (isOpen ? '▾ ' : '▸ ') + node.name,
+                      ),
+                      React.createElement('button', { title: '在这个文件夹里新建子文件夹', onClick: () => setNewDir({ parent: node.path, name: '' }), style: iconBtn }, '＋'),
+                      React.createElement('button', { title: '重命名', onClick: () => setRenaming({ path: node.path, name: node.name }), style: iconBtn }, '✎'),
+                    ),
+              ),
+              newDir !== null && newDir.parent === node.path
+                ? React.createElement(
+                    'div',
+                    { style: { display: 'flex', alignItems: 'center', gap: 2, padding: '3px 8px 3px ' + String(pad + 14) + 'px' } },
+                    nameEditor(
+                      newDir.name,
+                      (v) => setNewDir({ parent: node.path, name: v }),
+                      () => void submitNewDir(),
+                      () => setNewDir(null),
+                    ),
+                  )
+                : null,
+              isOpen ? renderNodes(node.children, depth + 1) : null,
+            )
+          }
+          const isPicked = picked !== null && picked.path === node.path
+          const isRenaming = renaming !== null && renaming.path === node.path
+          return React.createElement(
+            'div',
+            {
+              key: 'f-' + node.path,
+              onClick: () => {
+                if (!isRenaming) void openFile(node)
+              },
+              style: { display: 'flex', alignItems: 'center', gap: 2, padding: '4px 8px 4px ' + String(pad + 14) + 'px', cursor: isRenaming ? 'default' : 'pointer', background: isPicked ? 'rgba(10,132,255,0.08)' : 'transparent' },
+            },
+            isRenaming
+              ? nameEditor(
+                  renaming.name,
+                  (v) => setRenaming({ path: node.path, name: v }),
+                  () => void submitRename(),
+                  () => setRenaming(null),
+                )
+              : React.createElement(
+                  React.Fragment,
+                  null,
+                  React.createElement(
+                    'span',
+                    { style: { flex: 1, minWidth: 0, fontSize: 12, color: isPicked ? C.accent : C.text, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } },
+                    node.name,
+                  ),
+                  React.createElement(
+                    'button',
+                    { title: '重命名', onClick: (e) => { e.stopPropagation(); setRenaming({ path: node.path, name: node.name }) }, style: iconBtn },
+                    '✎',
+                  ),
+                ),
+          )
+        })
+      }
+
+      const rootCreator =
+        newDir !== null && newDir.parent === ''
+          ? React.createElement(
+              'div',
+              { style: { display: 'flex', alignItems: 'center', gap: 2, padding: '4px 8px' } },
+              nameEditor(
+                newDir.name,
+                (v) => setNewDir({ parent: '', name: v }),
+                () => void submitNewDir(),
+                () => setNewDir(null),
+              ),
+            )
+          : null
+
+      const left = React.createElement(
+        'div',
+        { style: { width: '30%', minWidth: 200, maxWidth: 340, display: 'flex', flexDirection: 'column', minHeight: 0, border: '1px solid ' + C.border, borderRadius: 8, overflow: 'hidden', background: C.card } },
+        React.createElement(
+          'div',
+          { style: { padding: '6px 8px', fontSize: 11, color: C.sub, background: C.rail, borderBottom: '1px solid ' + C.border, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6 } },
+          React.createElement('span', { style: { fontWeight: 600 } }, '设定文件'),
+          React.createElement('div', { style: { flex: 1 } }),
+          React.createElement('button', { onClick: () => setNewDir({ parent: '', name: '' }), style: { ...btn(), padding: '1px 8px', fontSize: 11 } }, '＋ 新建文件夹'),
+        ),
+        React.createElement(
+          'div',
+          { style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '2px 0' } },
+          loading
+            ? React.createElement('div', { style: { padding: 12, fontSize: 12, color: C.sub } }, '读取中…')
+            : React.createElement(React.Fragment, null, rootCreator, renderNodes(tree, 0)),
+        ),
+      )
+
+      const right = React.createElement(
+        'div',
+        { style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0, border: '1px solid ' + C.border, borderRadius: 8, overflow: 'hidden', background: C.card } },
+        React.createElement(
+          'div',
+          { style: { padding: '6px 12px', fontSize: 11.5, color: C.sub, background: C.rail, borderBottom: '1px solid ' + C.border, display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 } },
+          React.createElement('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, picked === null ? '没选文件' : picked.name),
+          picked === null ? null : React.createElement('span', { style: { fontSize: 11, flexShrink: 0 } }, String((editing ? draft : text).length) + ' 字'),
+          React.createElement('div', { style: { flex: 1 } }),
+          editing
+            ? React.createElement(
+                React.Fragment,
+                null,
+                React.createElement('button', { onClick: () => void saveFile(), disabled: busy, style: { ...btn('primary'), padding: '2px 10px', fontSize: 11.5 } }, busy ? '保存中…' : '保存'),
+                React.createElement('button', { onClick: () => { setEditing(false); setDraft(text) }, style: { ...btn(), padding: '2px 10px', fontSize: 11.5, marginLeft: 6 } }, '取消'),
+              )
+            : picked === null
+              ? null
+              : React.createElement('button', { onClick: () => { setDraft(text); setEditing(true) }, style: { ...btn(), padding: '2px 10px', fontSize: 11.5 } }, '编辑'),
+        ),
+        editing
+          ? React.createElement('textarea', {
+              value: draft,
+              onChange: (e) => setDraft(e.target.value),
+              style: { flex: 1, minHeight: 0, width: '100%', boxSizing: 'border-box', border: 'none', outline: 'none', resize: 'none', padding: '14px 18px', fontSize: 13, lineHeight: 1.9, fontFamily: 'inherit', background: 'transparent', color: C.text },
+            })
+          : React.createElement(
+              'div',
+              { style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '14px 18px', fontSize: 13, lineHeight: 1.9, whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: C.text } },
+              picked === null
+                ? React.createElement('div', { style: { color: C.sub, fontSize: 12.5 } }, '左边点一个文件，这里显示内容。')
+                : busy
+                  ? React.createElement('div', { style: { color: C.sub, fontSize: 12.5 } }, '读取中…')
+                  : text,
+            ),
+      )
+
+      return React.createElement('div', { style: { display: 'flex', height: '100%', minHeight: 0, gap: 12 } }, left, right)
+    }
+
+
+    // ══════════════════════════════════════════════════════════
+    // 设置页
+    // ══════════════════════════════════════════════════════════
+    /**
+     * 目录选择器。
+     *
+     * 两个诉求：
+     * 1. 不要手打路径——能点就点
+     * 2. 打开就把「像作品的地方」列出来，不用一层层翻
+     *
+     * 顶部是扫描到的候选（dir.discover），下面是当前位置的子文件夹（dir.list）。
+     */
+    function DirPicker({ kind, initial, onPick, onClose, toast }) {
+      const [list, setList] = useState(null)
+      const [found, setFound] = useState(null)
+      const [scanning, setScanning] = useState(true)
+      const [loading, setLoading] = useState(true)
+      const [picked, setPicked] = useState(String(initial || ''))
+      const [err, setErr] = useState('')
+      /** 路径栏里正在编辑的路径：可以手打或粘贴一个绝对路径跳过去 */
+      const [pathDraft, setPathDraft] = useState(String(initial || ''))
+      /**
+       * 「↓ 下一级」用的栈：每按一次「↑ 上一级」就把刚才待的目录压进来，
+       * 下一级再弹出来跳回去。走别的路（点「进入」、手打路径、浏览…）就清空，
+       * 免得跳到一个跟现在没关系的地方。
+       */
+      const downRef = useRef([])
+      const [canDown, setCanDown] = useState(false)
+      /** 正在等系统的文件夹选择窗口 */
+      const [browsing, setBrowsing] = useState(false)
+      const [makingBusy, setMakingBusy] = useState(false)
+
+      /**
+       * @param keepStack true 时不动「下一级」的栈（上一级 / 下一级自己用）
+       */
+      const load = async (target, keepStack) => {
+        setLoading(true)
+        setErr('')
+        try {
+          const d = await rpc('dir.list', { path: target })
+          setList(d)
+          setPathDraft(String(d.path))
+          if (target === '' || target === undefined) setPicked(d.path)
+          if (keepStack !== true) {
+            downRef.current = []
+            setCanDown(false)
+          }
+        } catch (e) {
+          const raw = String(e.message || e)
+          // 「读不到这个目录：D:\…\◆????」这种八成是路径里带进了乱码字符，
+          // 直接说清楚，别让作者去查权限。
+          setErr(
+            raw.includes('\uFFFD') || /[\u25C6\uFFFD]/u.test(raw)
+              ? '这个路径里有乱码字符（多半是粘贴进来的），点「📂 浏览…」重新选一次'
+              : raw,
+          )
+          setList(null)
+        } finally {
+          setLoading(false)
+        }
+      }
+
+      /** 「↑ 上一级」：记住现在这层，再上去 */
+      const historyUp = () => {
+        if (list === null || list.path === undefined) return
+        const parent = list.parent === undefined ? '' : String(list.parent)
+        if (parent === '') return
+        downRef.current.push(String(list.path))
+        void (async () => {
+          await load(parent, true)
+          setCanDown(downRef.current.length > 0)
+        })()
+      }
+
+      /** 「↓ 下一级」：回到刚才那一层 */
+      const historyDown = () => {
+        const target = downRef.current.pop()
+        if (target === undefined) return
+        void (async () => {
+          await load(target, true)
+          setCanDown(downRef.current.length > 0)
+        })()
+      }
+
+      /** 弹系统的文件夹选择窗口，挑完直接跳过去 */
+      const browse = async () => {
+        setBrowsing(true)
+        try {
+          const d = await rpc('dir.browse', { title: '选择' + wantedLabel })
+          if (d.canceled === true) {
+            if (d.reason !== undefined && d.reason !== '') toast('没打开选择窗口：' + String(d.reason))
+            return
+          }
+          void load(String(d.path))
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBrowsing(false)
+        }
+      }
+
+      /**
+       * 选中一个目录当作品用。
+       *
+       * 作者的做法是在系统「选择文件夹」窗口里点「新建文件夹」，然后选它——
+       * 那个文件夹是空的，插件不能因此不认。不是作品就把骨架补上（已有的不动）。
+       */
+      const pickDir = async (target, isProject) => {
+        try {
+          if (isProject !== true) {
+            const r = await rpc('work.init', { path: target })
+            if (Array.isArray(r.created) && r.created.length > 0) {
+              toast('已补好骨架：' + r.created.join(' '))
+            }
+          }
+          onPick(String(target))
+          onClose()
+        } catch (e) {
+          toast(String(e.message || e))
+        }
+      }
+
+      /** 把界面上那个「还不存在」的目录真建出来，连骨架一起，然后选中它 */
+      const createMissing = async () => {
+        if (list === null || list.missing !== true) return
+        setMakingBusy(true)
+        try {
+          const r = await rpc('work.create', { parent: String(list.parent), name: String(list.name) })
+          toast('已建好：' + String(r.name))
+          onPick(String(r.path))
+          onClose()
+        } catch (e) {
+          const msg = String(e.message || e)
+          toast(msg.includes('已经存在') ? '这个文件夹已经存在了，直接选它就行' : msg)
+        } finally {
+          setMakingBusy(false)
+        }
+      }
+
+      const discover = async (from) => {
+        setScanning(true)
+        try {
+          const d = await rpc('dir.discover', { from: from === undefined ? '' : from })
+          setFound(d)
+        } catch {
+          setFound(null)
+        } finally {
+          setScanning(false)
+        }
+      }
+
+      useEffect(() => {
+        void discover()
+        void load(String(initial || ''))
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [])
+
+      const wanted = kind === 'candidates' ? 'candidates' : 'project'
+      const wantedLabel = wanted === 'candidates' ? '候选目录' : '作品根'
+
+      const rowStyle = {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        padding: '7px 9px',
+        borderRadius: 7,
+        border: '1px solid ' + C.border,
+        marginBottom: 4,
+      }
+
+      /**
+       * 一行扫描结果。
+       *
+       * 选「候选目录」时扫出来的几乎都是作品根——不能因为类型不匹配就不给点，
+       * 应该点了一下子推导到它下面的 候选稿/第N章。
+       */
+      const hitRow = (it) => {
+        const direct = it.kind === wanted
+        const canDerive = wanted === 'candidates' && it.kind === 'project'
+        const canUse = direct || canDerive
+        const use = () => {
+          void (async () => {
+            if (direct) {
+              setPicked(String(it.path))
+              onPick(String(it.path))
+              onClose()
+              return
+            }
+            // 作品根 → 推导它的候选目录
+            try {
+              const r = await rpc('dir.candidateOf', { projectDir: String(it.path) })
+              setPicked(String(r.candidateDir))
+              onPick(String(r.candidateDir))
+              onClose()
+              if (typeof toast === 'function') {
+                toast('已选「' + String(r.name) + '」的候选目录：第' + String(r.nextChapter) + '章')
+              }
+            } catch (e) {
+              if (typeof toast === 'function') toast(String(e.message || e))
+            }
+          })()
+        }
+        return React.createElement(
+          'div',
+          { key: 'hit-' + String(it.path), style: { ...rowStyle, background: 'rgba(10,132,255,0.05)' } },
+          React.createElement('span', { style: { fontSize: 13 } }, it.kind === 'project' ? '📚' : '🗂'),
+          React.createElement(
+            'div',
+            { style: { flex: 1, minWidth: 0 } },
+            React.createElement('div', { style: { fontSize: 12, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, String(it.name)),
+            React.createElement('div', { style: { fontSize: 10, color: C.sub, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, String(it.path)),
+          ),
+          it.current === true ? React.createElement(Chip, { tone: C.accent }, '当前在写') : null,
+          React.createElement(Chip, { tone: it.kind === wanted ? C.ok : C.sub }, String(it.kindLabel)),
+          canUse
+            ? React.createElement(
+                'button',
+                {
+                  onClick: use,
+                  style: { ...btn(), padding: '1px 9px', fontSize: 10.5, color: C.accent, borderColor: C.accent + '55' },
+                },
+                direct ? '用这个' : '用它的候选目录',
+              )
+            : null,
+        )
+      }
+
+      return React.createElement(
+        'div',
+        {
+          style: {
+            position: 'fixed',
+            inset: 0,
+            zIndex: 1200,
+            background: 'rgba(0,0,0,0.45)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 20,
+          },
+          onClick: () => onClose(),
+        },
+        React.createElement(
+          'div',
+          {
+            onClick: (e) => e.stopPropagation(),
+            style: {
+              width: 'min(720px, 100%)',
+              maxHeight: '82vh',
+              display: 'flex',
+              flexDirection: 'column',
+              background: C.bg,
+              color: C.fg,
+              borderRadius: 14,
+              border: '1px solid ' + C.border,
+              boxShadow: '0 20px 60px rgba(0,0,0,0.35)',
+              overflow: 'hidden',
+            },
+          },
+          // 标题栏
+          React.createElement(
+            'div',
+            { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '12px 14px', borderBottom: '1px solid ' + C.border } },
+            React.createElement('div', { style: { fontSize: 13, fontWeight: 700 } }, '选择' + wantedLabel),
+            React.createElement('div', { style: { flex: 1 } }),
+            React.createElement('button', { onClick: () => onClose(), style: { ...btn(), padding: '2px 9px', fontSize: 11 } }, '关闭'),
+          ),
+          // 内容
+          React.createElement(
+            'div',
+            { style: { padding: '10px 14px', overflowY: 'auto', flex: 1 } },
+
+            // 扫描结果
+            React.createElement('div', { style: { fontSize: 11, fontWeight: 700, color: C.sub, marginBottom: 6 } }, '扫描到的位置' + (scanning ? '（正在扫…）' : found !== null && found.found !== undefined ? '（' + found.found.length + ' 个）' : '')),
+            found === null || found.found === undefined || found.found.length === 0
+              ? React.createElement('div', { style: { fontSize: 11, color: C.sub, marginBottom: 10 } }, scanning ? '识别中…' : '这附近没找到作品，往下翻目录，或直接在下面选。')
+              : React.createElement(
+                  'div',
+                  { style: { marginBottom: 10 } },
+                  ...found.found.map((it) => hitRow(it)),
+                ),
+
+            // 路径栏：手打 / 粘贴绝对路径直接跳过去，外加前进后退
+            React.createElement(
+              'div',
+              { style: { display: 'flex', alignItems: 'center', gap: 6, margin: '12px 0 6px' } },
+              React.createElement('div', { style: { fontSize: 11, fontWeight: 700, color: C.sub, flexShrink: 0 } }, '当前位置'),
+              React.createElement('input', {
+                value: pathDraft,
+                onChange: (e) => setPathDraft(e.target.value),
+                onKeyDown: (e) => {
+                  if (e.key !== 'Enter') return
+                  e.preventDefault()
+                  void load(pathDraft)
+                },
+                placeholder: '粘贴一个绝对路径，回车跳过去',
+                spellCheck: false,
+                style: { ...inputStyle, flex: 1, minWidth: 0, fontSize: 11, padding: '3px 8px' },
+              }),
+              // 回车即跳（不再单独放「前往」按钮，占地方）
+              React.createElement(
+                'button',
+                {
+                  onClick: historyUp,
+                  disabled: loading || list === null || list.parent === undefined || String(list.parent) === '',
+                  style: { ...btn(), padding: '2px 8px', fontSize: 10.5 },
+                  title: '到上一层',
+                },
+                '↑ 上一级',
+              ),
+              React.createElement(
+                'button',
+                {
+                  onClick: historyDown,
+                  disabled: loading || canDown !== true,
+                  style: { ...btn(), padding: '2px 8px', fontSize: 10.5 },
+                  title: '回到刚才那一层（按过「↑ 上一级」之后可用）',
+                },
+                '↓ 下一级',
+              ),
+              // 手动挑：弹系统的「选择文件夹」窗口，选完自动跳过去
+              React.createElement(
+                'button',
+                {
+                  onClick: () => void browse(),
+                  disabled: browsing === true,
+                  style: { ...btn(), padding: '2px 8px', fontSize: 10.5, color: C.accent, borderColor: C.accent + '55' },
+                  title: '打开系统的文件夹选择窗口，手动挑一个目录',
+                },
+                browsing === true ? '选择中…' : '📂 浏览…',
+              ),
+            ),
+
+
+            err !== ''
+              ? React.createElement('div', { style: { fontSize: 11, color: C.danger || C.warn, marginBottom: 8 } }, err)
+              : null,
+
+            // 系统「选择文件夹」窗口允许直接输入新名字后确定，返回的路径可能还没落盘。
+            // 这时不报错，问一句要不要就地建出来（连骨架一起）。
+            list !== null && list.missing === true
+              ? React.createElement(
+                  'div',
+                  { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8, padding: '8px 10px', border: '1px solid ' + C.ok + '55', background: 'rgba(52,199,89,0.08)', borderRadius: 8 } },
+                  React.createElement('span', { style: { fontSize: 11.5, lineHeight: 1.7 } }, '「' + String(list.name) + '」还不存在，是要新建这个作品文件夹吗？'),
+                  React.createElement('div', { style: { flex: 1 } }),
+                  React.createElement(
+                    'button',
+                    {
+                      onClick: () => void createMissing(),
+                      disabled: makingBusy === true,
+                      style: { ...btn('primary'), padding: '3px 12px', fontSize: 11 },
+                    },
+                    makingBusy === true ? '建…' : '建好它',
+                  ),
+                )
+              : null,
+
+            loading
+              ? React.createElement('div', { style: { fontSize: 11, color: C.sub, padding: 12 } }, '读取中…')
+              : list === null
+                ? null
+                : list.items.length === 0
+                  ? React.createElement('div', { style: { fontSize: 11, color: C.sub, padding: '6px 0' } }, '这层没有子文件夹')
+                  : React.createElement(
+                      'div',
+                      null,
+                      ...list.items.map((it) =>
+                        React.createElement(
+                          'div',
+                          { key: 'd-' + String(it.path), style: rowStyle },
+                          React.createElement('span', { style: { fontSize: 13 } }, '📁'),
+                          React.createElement(
+                            'div',
+                            {
+                              onClick: () => void load(String(it.path)),
+                              style: { flex: 1, minWidth: 0, cursor: 'pointer' },
+                            },
+                            React.createElement(
+                              'div',
+                              { style: { fontSize: 12, display: 'flex', alignItems: 'center', gap: 6 } },
+                              React.createElement('span', null, String(it.name)),
+                              it.kindLabel === '' ? null : React.createElement(Chip, { tone: it.kind === wanted ? C.ok : C.sub }, String(it.kindLabel)),
+                            ),
+                          ),
+                          React.createElement('button', { onClick: () => void load(String(it.path)), style: { ...btn(), padding: '1px 8px', fontSize: 10.5 } }, '进入'),
+                          React.createElement(
+                            'button',
+                            {
+                              onClick: () => {
+                                setPicked(String(it.path))
+                                void pickDir(String(it.path), it.kind === 'project')
+                              },
+                              style: { ...btn(), padding: '1px 8px', fontSize: 10.5, color: C.accent, borderColor: C.accent + '55' },
+                            },
+                            '选它',
+                          ),
+                        ),
+                      ),
+                    ),
+          ),
+          // 底部
+          React.createElement(
+            'div',
+            { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderTop: '1px solid ' + C.border } },
+            React.createElement('div', { style: { flex: 1, fontSize: 10.5, color: C.sub, wordBreak: 'break-all' } }, picked === '' ? '还没选' : picked),
+            list !== null && list.path !== undefined
+              ? React.createElement(
+                  'button',
+                  {
+                    onClick: () => {
+                      void pickDir(String(list.path), list.kind === 'project')
+                    },
+                    style: { ...btn('primary') },
+                  },
+                  list.kind === 'project' ? '用当前目录' : '用这个目录（自动补好骨架）',
+                )
+              : null,
+          ),
+        ),
+      )
+    }
+
+    function SettingsPage({ state, onRefresh, toast }) {
+      const cfg = state !== null && state.config !== undefined ? state.config : {}
+      const [candidateDir, setCandidateDir] = useState(String(cfg.candidateDir || ''))
+      const [projectDir, setProjectDir] = useState(String(cfg.projectDir || ''))
+      const [busy, setBusy] = useState(false)
+      // 目录选择器：null = 关着，'candidates' / 'project' = 正在选哪一项
+      const [picker, setPicker] = useState(null)
+      const [fontSize, setFontSize] = useState(Number(cfg.readFontSize === undefined ? 13.5 : cfg.readFontSize))
+      const [uiScale, setUiScale] = useState(Number(cfg.uiScale === undefined ? 1 : cfg.uiScale))
+
+      useEffect(() => {
+        setCandidateDir(String(cfg.candidateDir || ''))
+        setProjectDir(String(cfg.projectDir || ''))
+        setFontSize(Number(cfg.readFontSize === undefined ? 13.5 : cfg.readFontSize))
+        setUiScale(Number(cfg.uiScale === undefined ? 1 : cfg.uiScale))
+      }, [cfg.candidateDir, cfg.projectDir, cfg.readFontSize, cfg.uiScale])
+
+      const save = async () => {
+        setBusy(true)
+        try {
+          await rpc('config.save', { candidateDir, projectDir })
+          toast('配置已保存')
+          onRefresh()
+        } catch (e) {
+          toast(String(e.message || e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      return React.createElement(
+        'div',
+        { style: { maxWidth: 640 } },
+        picker === null
+          ? null
+          : React.createElement(DirPicker, {
+              kind: picker,
+              initial: picker === 'candidates' ? candidateDir : projectDir,
+              onPick: (v) => {
+                if (picker === 'candidates') setCandidateDir(v)
+                else setProjectDir(v)
+              },
+              onClose: () => setPicker(null),
+              toast,
+            }),
+        React.createElement(
+          'div',
+          { style: { ...cardStyle, padding: 14 } },
+          React.createElement('div', { style: { fontSize: 12.5, fontWeight: 600, margin: '14px 0 4px' } }, '作品根（可选）'),
+          React.createElement('div', { style: { fontSize: 11, color: C.sub, marginBottom: 7, lineHeight: 1.7 } }, '留空则自动向上探测作品根。填了就以它为准。'),
+          React.createElement(
+            'div',
+            { style: { display: 'flex', gap: 8 } },
+            React.createElement('input', { value: projectDir, onChange: (e) => setProjectDir(e.target.value), style: { ...inputStyle, flex: 1, minWidth: 0 } }),
+            React.createElement('button', { onClick: () => setPicker('project'), style: { ...btn(), whiteSpace: 'nowrap' } }, '📂 浏览'),
+            projectDir !== ''
+              ? React.createElement('button', { onClick: () => setProjectDir(''), style: { ...btn(), whiteSpace: 'nowrap' } }, '清空')
+              : null,
+          ),
+          React.createElement('div', { style: { fontSize: 12.5, fontWeight: 600, margin: '16px 0 4px' } }, '阅读字号'),
+          React.createElement('div', { style: { fontSize: 11, color: C.sub, marginBottom: 7, lineHeight: 1.7 } }, '正文编辑区的字大小。觉得字小就调大。'),
+          React.createElement(
+            'div',
+            { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
+            ...[
+              { v: 12, label: '小' },
+              { v: 13.5, label: '标准' },
+              { v: 15, label: '大' },
+              { v: 17, label: '特大' },
+              { v: 19, label: '巨大' },
+            ].map((o) =>
+              React.createElement(
+                'button',
+                {
+                  key: 'fs' + String(o.v),
+                  onClick: () => {
+                    setFontSize(o.v)
+                    void (async () => {
+                      try {
+                        await rpc('config.save', { readFontSize: o.v })
+                        toast('阅读字号已设为' + o.label)
+                        onRefresh()
+                      } catch (e) {
+                        toast(String(e.message || e))
+                      }
+                    })()
+                  },
+                  style: {
+                    ...btn(),
+                    padding: '4px 12px',
+                    fontSize: 12,
+                    background: Math.abs(fontSize - o.v) < 0.1 ? C.accent : 'transparent',
+                    color: Math.abs(fontSize - o.v) < 0.1 ? '#fff' : C.text,
+                    borderColor: Math.abs(fontSize - o.v) < 0.1 ? C.accent : C.border,
+                  },
+                },
+                o.label,
+              ),
+            ),
+          ),
+          React.createElement(
+            'div',
+            { style: { fontSize: 11, color: C.sub, marginTop: 6 } },
+            '预览：' + '这一段的字会按 ' + String(fontSize) + 'px 显示。',
+          ),
+          React.createElement('div', { style: { fontSize: 12.5, fontWeight: 600, margin: '16px 0 4px' } }, '界面缩放'),
+          React.createElement('div', { style: { fontSize: 11, color: C.sub, marginBottom: 7, lineHeight: 1.7 } }, '整体放大导航、说明文字。改完立即生效，不用重启。'),
+          React.createElement(
+            'div',
+            { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
+            ...[
+              { v: 1, label: '标准' },
+              { v: 1.1, label: '110%' },
+              { v: 1.2, label: '120%' },
+              { v: 1.35, label: '135%' },
+            ].map((o) =>
+              React.createElement(
+                'button',
+                {
+                  key: 'us' + String(o.v),
+                  onClick: () => {
+                    void (async () => {
+                      try {
+                        await rpc('config.save', { uiScale: o.v })
+                        toast('界面缩放已设为 ' + o.label)
+                        onRefresh()
+                      } catch (e) {
+                        toast(String(e.message || e))
+                      }
+                    })()
+                  },
+                  style: {
+                    ...btn(),
+                    padding: '4px 12px',
+                    fontSize: 12,
+                    background: Math.abs(uiScale - o.v) < 0.01 ? C.accent : 'transparent',
+                    color: Math.abs(uiScale - o.v) < 0.01 ? '#fff' : C.text,
+                    borderColor: Math.abs(uiScale - o.v) < 0.01 ? C.accent : C.border,
+                  },
+                },
+                o.label,
+              ),
+            ),
+          ),
+          React.createElement('button', { onClick: () => void save(), disabled: busy, style: { ...btn('primary'), marginTop: 14 } }, busy ? '保存中…' : '保存配置'),
+        ),
+        state !== null && state.project !== null
+          ? React.createElement(
+              'div',
+              { style: { ...cardStyle, padding: 14, marginTop: 12, fontSize: 11.5, color: C.sub, lineHeight: 1.9, wordBreak: 'break-all' } },
+              '当前作品：' + String(state.project.name),
+              React.createElement('br'),
+              '作品根：' + String(state.project.dir),
+              React.createElement('br'),
+              '识别方式：' + (state.project.source === 'setting' ? '设置里手填' : '自动探测'),
+            )
+          : null,
+      )
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // 外壳
+    // ══════════════════════════════════════════════════════════
+    const PAGES = [
+      { id: 'chapters', icon: '📖', label: '章节' },
+      { id: 'trash', icon: '🗑', label: '回收站' },
+      { id: 'rules', icon: '📌', label: '指令' },
+      { id: 'files', icon: '📁', label: '设定' },
+      { id: 'settings', icon: '⚙️', label: '设置' },
+    ]
+
+    function Studio() {
+      const [page, setPage] = useState('chapters')
+      const [state, setState] = useState(null)
+      const [loading, setLoading] = useState(true)
+      const [notice, setNotice] = useState('')
+      const [bookPicker, setBookPicker] = useState(false)
+      const [refreshing, setRefreshing] = useState(false)
+      // 切页面时的未保存确认（就地弹，不依赖外层浮层）
+      const [pageAsk, setPageAsk] = useState(null)
+
+      /** 切页前先问：有脏就挂起，没有就直接切 */
+      const gotoPage = (id) => {
+        if (id === page) return
+        const dirty = typeof leaveFlow.dirtyOnes === 'function' ? leaveFlow.dirtyOnes() : []
+        if (dirty.length === 0) {
+          setPage(id)
+          return
+        }
+        setPageAsk({ target: id, dirty })
+      }
+
+      const refresh = useCallback(async () => {
+        try {
+          const d = await rpc('state', { force: true })
+          setState(d)
+        } catch (e) {
+          setNotice(String(e.message || e))
+        } finally {
+          setLoading(false)
+        }
+      }, [])
+
+      useEffect(() => {
+        void refresh()
+      }, [refresh])
+
+      const toast = useCallback((msg) => {
+        setNotice(msg)
+        window.setTimeout(() => setNotice(''), 6000)
+      }, [])
+
+      const title = state !== null && state.project !== null ? state.project.name : '未识别作品'
+      const totals = state !== null && state.totals !== undefined ? state.totals : { chapters: 0, chars: 0 }
+
+      // 界面缩放：用 zoom 整体放大导航与小字
+      const scale = state !== null && state.config !== undefined && state.config.uiScale !== undefined ? Number(state.config.uiScale) : 1
+      const safeScale = Number.isFinite(scale) && scale >= 0.8 && scale <= 1.6 ? scale : 1
+
+      return React.createElement(
+        'div',
+        { style: { display: 'flex', height: '100%', minHeight: 0, background: C.bg, color: C.text, fontSize: 13, zoom: safeScale } },
+        bookPicker
+          ? React.createElement(DirPicker, {
+              kind: 'project',
+              initial: state !== null && state.project !== null ? String(state.project.dir) : '',
+              onPick: (v) => {
+                void (async () => {
+                  try {
+                    const r = await rpc('book.switch', { projectDir: v })
+                    toast('已切到「' + String(r.name) + '」，下一章候选目录：第' + String(r.nextChapter) + '章')
+                    await refresh()
+                  } catch (e) {
+                    toast(String(e.message || e))
+                  }
+                })()
+              },
+              onClose: () => setBookPicker(false),
+              toast,
+            })
+          : null,
+        // 左导航
+        React.createElement(
+          'div',
+          { style: { width: 168, flexShrink: 0, borderRight: '1px solid ' + C.border, background: C.card, display: 'flex', flexDirection: 'column', padding: '10px 8px' } },
+          React.createElement('div', { style: { fontSize: 13, fontWeight: 700, padding: '4px 8px 12px' } }, '📚 小说工坊'),
+          ...PAGES.map((p) =>
+            React.createElement(
+              'button',
+              {
+                key: p.id,
+                onClick: () => gotoPage(p.id),
+                style: {
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 9,
+                  width: '100%',
+                  textAlign: 'left',
+                  border: 'none',
+                  background: page === p.id ? 'rgba(10,132,255,0.12)' : 'transparent',
+                  color: page === p.id ? C.accent : C.text,
+                  fontWeight: page === p.id ? 600 : 400,
+                  borderRadius: 8,
+                  padding: '7px 9px',
+                  fontSize: 12.5,
+                  cursor: 'pointer',
+                  marginBottom: 2,
+                },
+              },
+              React.createElement('span', null, p.icon),
+              React.createElement('span', null, p.label),
+            ),
+          ),
+          React.createElement('div', { style: { flex: 1 } }),
+          React.createElement('div', { style: { fontSize: 10.5, color: C.sub, padding: '6px 8px', lineHeight: 1.7 } }, String(totals.chapters) + ' 章 · ' + fmtChars(totals.chars)),
+          React.createElement('div', { style: { fontSize: 9.5, color: C.sub, padding: '0 8px 4px', opacity: 0.6 } }, VERSION_TEXT),
+          React.createElement('button', { onClick: () => leaveFlow.request(() => setOpen(false)), style: { ...btn('ghost'), fontSize: 11.5, textAlign: 'left' } }, '← 收起工作台'),
+        ),
+        // 右内容
+        React.createElement(
+          'div',
+          { style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0 } },
+          React.createElement(
+            'div',
+            { style: { display: 'flex', alignItems: 'center', gap: 10, padding: '9px 16px', borderBottom: '1px solid ' + C.border, background: C.card, flexShrink: 0 } },
+            React.createElement(
+              'button',
+              {
+                onClick: () => setBookPicker(true),
+                title: '换一本 / 查看识别到的作品',
+                style: {
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 5,
+                  border: '1px solid ' + C.border,
+                  background: C.bg,
+                  color: C.text,
+                  borderRadius: 8,
+                  padding: '3px 9px',
+                  fontSize: 13,
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                  maxWidth: 320,
+                },
+              },
+              React.createElement('span', null, '📚'),
+              React.createElement('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, title),
+              React.createElement('span', { style: { fontSize: 10, color: C.sub } }, '▾'),
+            ),
+            React.createElement('span', { style: { fontSize: 11, color: C.sub } }, String(totals.chapters) + ' 章 · ' + fmtChars(totals.chars)),
+            React.createElement('div', { style: { flex: 1 } }),
+            React.createElement(
+              'button',
+              {
+                onClick: () => {
+                  void (async () => {
+                    setRefreshing(true)
+                    try {
+                      await refresh()
+                      // 当前页若有自己独立的数据源（回收站、设定…），也让它重读
+                      window.dispatchEvent(new CustomEvent('novel-studio:refresh'))
+                      toast('已重新读取：' + String(totals.chapters) + ' 章 · ' + fmtChars(totals.chars))
+                    } finally {
+                      setRefreshing(false)
+                    }
+                  })()
+                },
+                disabled: refreshing,
+                style: { ...btn(), padding: '3px 10px', fontSize: 11.5 },
+              },
+              refreshing ? '↻ 读取中…' : '↻ 刷新',
+            ),
+          ),
+          notice === '' ? null : React.createElement('div', { style: { padding: '7px 16px', fontSize: 11.5, color: C.sub, borderBottom: '1px solid ' + C.border, background: 'rgba(10,132,255,0.06)' } }, notice),
+          React.createElement(
+            'div',
+            { style: { flex: 1, minHeight: 0, padding: 14, overflow: 'hidden' } },
+            loading
+              ? React.createElement(Empty, null, '读取中…')
+              : page === 'chapters'
+                ? React.createElement(ChapterPage, { state, onRefresh: refresh, toast })
+                : page === 'drafts'
+                  ? React.createElement(DraftsPage, { state, onRefresh: refresh, toast })
+                  : page === 'trash'
+                    ? React.createElement(TrashPage, { toast })
+                    : page === 'plot'
+                      ? React.createElement(PlotPage, { toast })
+                    : page === 'rules'
+                      ? React.createElement(RulesPage, { toast })
+                    : page === 'profile'
+                      ? React.createElement(ProfilePage, { state, onRefresh: refresh, toast })
+                      : page === 'files'
+                        ? React.createElement(FilesPage, { toast })
+                        : React.createElement(SettingsPage, { state, onRefresh: refresh, toast }),
+          ),
+        ),
+        // 切页面的未保存确认（就地渲染，不依赖外层浮层）
+        pageAsk === null
+          ? null
+          : React.createElement(
+              'div',
+              {
+                style: {
+                  position: 'fixed',
+                  inset: 0,
+                  zIndex: 960,
+                  background: 'rgba(0,0,0,0.38)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  padding: 20,
+                },
+              },
+              React.createElement(
+                'div',
+                {
+                  style: {
+                    width: 'min(420px, 100%)',
+                    background: C.card,
+                    color: C.text,
+                    border: '1px solid ' + C.border,
+                    borderRadius: 12,
+                    boxShadow: '0 20px 60px rgba(0,0,0,0.35)',
+                    padding: 18,
+                  },
+                },
+                React.createElement('div', { style: { fontSize: 13.5, fontWeight: 700, marginBottom: 6 } }, '⚠️ 还有没保存的修改'),
+                ...pageAsk.dirty.map((g) =>
+                  React.createElement('div', { key: g.id, style: { fontSize: 12, color: C.sub, lineHeight: 1.9 } }, '· ' + String(g.label)),
+                ),
+                React.createElement(
+                  'div',
+                  { style: { display: 'flex', gap: 8, marginTop: 16, justifyContent: 'flex-end' } },
+                  React.createElement('button', { onClick: () => setPageAsk(null), style: btn() }, '取消'),
+                  React.createElement(
+                    'button',
+                    {
+                      onClick: () => {
+                        const target = pageAsk.target
+                        setPageAsk(null)
+                        setPage(target)
+                      },
+                      style: btn('danger'),
+                    },
+                    '不保存',
+                  ),
+                  React.createElement(
+                    'button',
+                    {
+                      onClick: async () => {
+                        const ask = pageAsk
+                        setPageAsk(null)
+                        for (const g of ask.dirty) {
+                          try {
+                            await g.save()
+                          } catch {
+                            // 单处保存失败不挡切换
+                          }
+                        }
+                        setPage(ask.target)
+                      },
+                      style: btn('primary'),
+                    },
+                    '保存并离开',
+                  ),
+                ),
+              ),
+            ),
+      )
+    }
+
+    /** 侧栏入口按钮 */
+    /**
+     * 侧栏底部的入口。
+     *
+     * 这个插槽是「设置旁边的可选动作」，水平排一排，同槽还有别的插件。
+     * 所以不能设 width:100%——那会独占整行，把别人挤成竖排。
+     * 也不能让文字换行，用 nowrap + flexShrink:0 保持自己的宽度。
+     * 侧栏收成 56px 轨道时（wide=false）只留图标。
+     */
+    function Entry(props) {
+      const open = useOpen()
+      const wide = props !== null && props !== undefined && props.wide === false ? false : true
+      return React.createElement(
+        'button',
+        {
+          onClick: () => setOpen(!open),
+          style: {
+            display: 'flex',
+            alignItems: 'center',
+            gap: 5,
+            flexShrink: 0,
+            whiteSpace: 'nowrap',
+            border: 'none',
+            background: open ? 'rgba(10,132,255,0.12)' : 'transparent',
+            color: open ? C.accent : 'inherit',
+            padding: '6px 7px',
+            borderRadius: 7,
+            fontSize: 12,
+            lineHeight: 1.2,
+            cursor: 'pointer',
+          },
+          title: '小说工坊（点一下打开）',
+        },
+        React.createElement('span', { style: { fontSize: 13 } }, '📚'),
+        wide ? React.createElement('span', null, '小说工坊') : null,
+      )
+    }
+
+    exports.inject = ['slots']
+    exports.apply = function (ctx) {
+      ctx.slots.inject('sidebar.footer.action', () =>
+        ctx.slots.register({ name: 'sidebar.footer.action', id: 'novel-studio', order: 9, label: () => '小说工坊' }, () => React.createElement(Entry)),
+      )
+      ctx.slots.inject('shell.overlay', () =>
+        ctx.slots.register({ name: 'shell.overlay', id: 'novel-studio-panel', order: 25 }, () =>
+          React.createElement(Shell, null),
+        ),
+      )
+    }
+
+    /** 浮层外壳：只管开合，内容交给 Studio */
+    function Shell() {
+      const open = useOpen()
+      const [pending, setPending] = useState(leaveFlow.pending)
+      /**
+       * 第一次打开之前不渲染 Studio（省掉开页面就发请求），
+       * 打开过一次之后就**永不卸载**，只用 display 收起。
+       * 一卸载，当前页面、开着的候选稿、正在跑的写稿循环全都会被打回初始状态，
+       * 表现为「点回来又变成章节页、生成也停了」。
+       */
+      const [everOpen, setEverOpen] = useState(open === true)
+
+      useEffect(() => leaveFlow.subscribe(() => setPending(leaveFlow.pending)), [])
+
+      useEffect(() => {
+        if (open === true && everOpen !== true) setEverOpen(true)
+      }, [open, everOpen])
+
+      if (everOpen !== true) return null
+
+      // 未保存确认层：保存 / 不保存 / 取消
+      const ask =
+        pending === null
+          ? null
+          : React.createElement(
+              'div',
+              {
+                style: {
+                  position: 'fixed',
+                  inset: 0,
+                  zIndex: 980,
+                  background: 'rgba(0,0,0,0.45)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  padding: 20,
+                },
+              },
+              React.createElement(
+                'div',
+                {
+                  style: {
+                    width: 'min(420px, 100%)',
+                    background: C.card,
+                    color: C.text,
+                    border: '1px solid ' + C.border,
+                    borderRadius: 12,
+                    boxShadow: '0 20px 60px rgba(0,0,0,0.35)',
+                    padding: 18,
+                  },
+                },
+                React.createElement('div', { style: { fontSize: 13.5, fontWeight: 700, marginBottom: 8 } }, '⚠️ 还有没保存的修改'),
+                ...pending.dirty.map((g) =>
+                  React.createElement('div', { key: g.id, style: { fontSize: 12.5, color: C.sub, lineHeight: 1.9 } }, '· ' + String(g.label)),
+                ),
+                React.createElement(
+                  'div',
+                  { style: { display: 'flex', gap: 8, marginTop: 16, justifyContent: 'flex-end' } },
+                  React.createElement('button', { onClick: () => leaveFlow.cancel(), style: btn() }, '取消'),
+                  React.createElement('button', { onClick: () => leaveFlow.resolveSave(false), style: btn('danger') }, '不保存'),
+                  React.createElement('button', { onClick: () => leaveFlow.resolveSave(true), style: btn('primary') }, '保存并离开'),
+                ),
+              ),
+            )
+      return React.createElement(
+        'div',
+        {
+          style: {
+            position: 'fixed',
+            inset: 0,
+            zIndex: 900,
+            background: 'rgba(0,0,0,0.35)',
+            display: open === true ? 'flex' : 'none',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 24,
+          },
+          onMouseDown: (e) => {
+            if (e.target === e.currentTarget) leaveFlow.request(() => setOpen(false))
+          },
+        },
+        React.createElement(
+          'div',
+          {
+            style: {
+              width: 'min(1240px, 100%)',
+              height: 'min(820px, 100%)',
+              background: C.card,
+              color: C.text,
+              borderRadius: 14,
+              border: '1px solid ' + C.border,
+              boxShadow: '0 24px 70px rgba(0,0,0,0.35)',
+              overflow: 'hidden',
+              display: 'flex',
+              flexDirection: 'column',
+            },
+          },
+          React.createElement(Studio),
+          ask,
+        ),
+      )
+    }
+
+    // 注意：不能写 module.exports = {...}——那会把上面挂在 exports 上的
+    // apply / inject 一起覆盖掉，宿主就再也拿不到注册入口（表现为「没有 UI 入口」）。
+    exports.Entry = Entry
+    exports.Studio = Studio
+    exports.Shell = Shell
+    exports.rpc = rpc
+
+    return module.exports
+  },
+})

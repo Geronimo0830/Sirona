@@ -1,0 +1,17 @@
+node_modules/
+dist/
+release/
+test-results/
+playwright-report/
+*.log
+.env*
+!tests/fixtures/
+
+.build-cache/
+.build-tmp/
+
+# 本机验收与构建记录
+/docs/evidence/
+/docs/acceptance-report.md
+/docs/build-report.md
+/PROGRESS.md

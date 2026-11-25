@@ -1,0 +1,142 @@
+[
+  {
+    "path": "cordis.patch.yml",
+    "bytes": 365,
+    "sha256": "1A7A7B15F73D0B9D9768061533CDE20334592894F41CA3875A1C826F0BFB5CFE"
+  },
+  {
+    "path": "install.mjs",
+    "bytes": 2768,
+    "sha256": "C7061A8D6B159EB50500DC87C9FB0D141D805F3A4CB8C22B0420BAAABB2B00A0"
+  },
+  {
+    "path": "LICENSE",
+    "bytes": 1086,
+    "sha256": "563DBC216501991F633F2238A9D5E7EE475C3891781CADB7F96AAF9FDABC5B28"
+  },
+  {
+    "path": "package.json",
+    "bytes": 1789,
+    "sha256": "00D00FDB65640CDDB2E666C5A7761A665B6EDA03E04162FF739487F50FEF3142"
+  },
+  {
+    "path": "README.md",
+    "bytes": 15881,
+    "sha256": "D902E423979FEF3610211194D6A5704EDA35678DD55AAFEC44734D6F692F4997"
+  },
+  {
+    "path": "lib\\client.js",
+    "bytes": 303317,
+    "sha256": "B67C6D847F07133C60D1CC1C0ECC1FDC646070FF46A34C589712302C5999EFBC"
+  },
+  {
+    "path": "lib\\index.js",
+    "bytes": 6659,
+    "sha256": "15D00484DB96ECD4B2803149DD2706EE11F38407F20DBE744471E6230D20416F"
+  },
+  {
+    "path": "lib\\core\\annotate.js",
+    "bytes": 16774,
+    "sha256": "B0085CA139CDFD0321137BEE13A1BCA20B026B9875ED216C1F2F18C8D4110D56"
+  },
+  {
+    "path": "lib\\core\\detail.js",
+    "bytes": 2530,
+    "sha256": "755C4EFF8CBC7E792F0C060215599EF80CE0395487800A9228F2F56891A1E973"
+  },
+  {
+    "path": "lib\\core\\draft.js",
+    "bytes": 17837,
+    "sha256": "7A190AA6D273E7CF7A5E705620FB2D975A8C0F7304AA1AE70370C7C2398DBEF0"
+  },
+  {
+    "path": "lib\\core\\ledger.js",
+    "bytes": 32676,
+    "sha256": "2CA535D45B2EAE64544771D83AB904990D8468A1B09FD2F896F9419D56BBB325"
+  },
+  {
+    "path": "lib\\core\\llm.js",
+    "bytes": 5809,
+    "sha256": "B78BEE78433B2D0A673259AE471324776444385AB365D04A7FA3F7E17BB019C1"
+  },
+  {
+    "path": "lib\\core\\pack.js",
+    "bytes": 23197,
+    "sha256": "9C5707053288FD5E2F9ED29314603812158789D022C28AEF7877860F28E5D80F"
+  },
+  {
+    "path": "lib\\core\\pipeline.js",
+    "bytes": 47387,
+    "sha256": "242CBB96FEF2D3530CFDD0D583D666211B2F08E3EA0F750CAF0197E08A85AEEC"
+  },
+  {
+    "path": "lib\\core\\plot.js",
+    "bytes": 66663,
+    "sha256": "7D86F7505B8FF7939C94A8B6A0AEDBA3174FBF894FC9F4DF455F3DAADE24F118"
+  },
+  {
+    "path": "lib\\core\\provenance.js",
+    "bytes": 13899,
+    "sha256": "66BA80626F1FFA5332CE87FF296233A6EC29183B814FD610D29FA771BFF7ABE1"
+  },
+  {
+    "path": "lib\\core\\rules.js",
+    "bytes": 8959,
+    "sha256": "851397B61C959EAB56737EB183BE5940DAD107404A887C38AC626AA5CD8C265D"
+  },
+  {
+    "path": "lib\\core\\text.js",
+    "bytes": 7970,
+    "sha256": "56085E71959736FCC77D046A95DBEFB442D41BFC8905C2E38919E11DDF40065E"
+  },
+  {
+    "path": "lib\\core\\workspace.js",
+    "bytes": 22240,
+    "sha256": "459EFB8B448FC34095F18B1831FC1F0719C8FA14A117AA2F1F33F6DB5D760D02"
+  },
+  {
+    "path": "lib\\server\\api.js",
+    "bytes": 237895,
+    "sha256": "C2BF32BBAA0CB91242148A2FD8EE39793CDA362370D2A31F28038BD1E9D6C00D"
+  },
+  {
+    "path": "lib\\server\\context.js",
+    "bytes": 8608,
+    "sha256": "7200EBFFBF464F073E3A426B662467397DBB0443F7E3E6EA8B17F2C5A68ACB22"
+  },
+  {
+    "path": "lib\\server\\cross-learn.js",
+    "bytes": 6988,
+    "sha256": "073B62704C65E1C2EDC12891E5D8CAD645E678A2A33F6527D34256A0D8C31C45"
+  },
+  {
+    "path": "lib\\server\\distill.js",
+    "bytes": 7776,
+    "sha256": "2548036128131733113C2CFDED2C639DD16D3C3F7BBD51302CFCD3861551F6A7"
+  },
+  {
+    "path": "lib\\server\\novel-import.js",
+    "bytes": 9141,
+    "sha256": "DF384FC5950BA434B4CBEB6F6713A80232937B7C4A8F1299A67E5AAAF78056A5"
+  },
+  {
+    "path": "lib\\server\\novel-learn.js",
+    "bytes": 12237,
+    "sha256": "9D81ADD395EE3CDA9453607FDCEE4A26AC220A884754AEF0BDFAFFBA71BF46F9"
+  },
+  {
+    "path": "lib\\server\\pack-assemble.js",
+    "bytes": 11729,
+    "sha256": "5533B9D21496013D35F6E528EA0D36D45DEDCD4AE931D79F231EE91558EAD309"
+  },
+  {
+    "path": "lib\\server\\summary.js",
+    "bytes": 6976,
+    "sha256": "6640522E16236FA3E5F8C665B46813E52708E62727936EEC17783755B4FB89DB"
+  },
+  {
+    "path": "lib\\server\\work-create.js",
+    "bytes": 4632,
+    "sha256": "950C3B6020D6ED15244C12DCED699CDD2130C9B55BF3812BDEB6FF7BAEBF8396"
+  }
+]

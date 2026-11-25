@@ -1,0 +1,2 @@
+# Keep the legacy snapshot byte-for-byte consistent with docs/source-manifest.json.
+/vendor/legacy-dsh-novel-workbench/** -text
